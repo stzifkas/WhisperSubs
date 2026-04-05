@@ -55,23 +55,26 @@ class Translator:
 
         if target_language:
             task = (
-                f"1. Correct: fix any transcription errors in the source text "
+                f"1. Correct: fix any transcription errors in the user's message "
                 f"(misspelled names, mishearings, wrong technical terms). "
-                f"Keep the original language and meaning.\n"
+                f"The corrected 'source' must be a faithful correction of what was SAID — "
+                f"never a description, summary, or paraphrase of the topic.\n"
                 f"2. Translate: translate the corrected text to {target_language}.\n\n"
                 f'Return ONLY this JSON: {{"source": "corrected text", "translation": "translated text"}}'
             )
         else:
             task = (
                 "Correct any transcription errors (misspelled names, mishearings, "
-                "wrong technical terms). Keep the original language and meaning.\n\n"
+                "wrong technical terms). Keep the original language and meaning. "
+                "The corrected 'source' must be a faithful correction of what was SAID — "
+                "never a description or paraphrase.\n\n"
                 'Return ONLY this JSON: {"source": "corrected text"}'
             )
 
         messages: list[dict] = [{"role": "system", "content": task}]
 
         if has_context:
-            ctx_lines = []
+            ctx_lines = ["Background context (do NOT reproduce in output):"]
             if ctx.summary:
                 ctx_lines.append(f"Topic: {ctx.summary}")
             if ctx.glossary:
@@ -96,6 +99,12 @@ class Translator:
         except (json.JSONDecodeError, AttributeError):
             logger.warning("process(): failed to parse JSON response, using raw")
             return ProcessResult(source=raw)
+
+        # Guard: if the model returned something wildly longer than the input it
+        # probably leaked the topic summary instead of correcting the transcript.
+        if len(refined) > len(raw) * 2.5 and len(refined) - len(raw) > 60:
+            logger.warning("process(): source suspiciously long (raw=%d, refined=%d), using raw", len(raw), len(refined))
+            refined = raw
 
         if ctx is not None:
             if ctx.target_language and ctx.target_language != target_language:
