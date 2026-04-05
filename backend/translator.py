@@ -132,10 +132,3 @@ class Translator:
         finally:
             ctx._updating = False
 
-    def transcription_hint(self, ctx: TranslationContext | None) -> str:
-        """Return a minimal style hint for Whisper — no full sentences or term lists,
-        as those get hallucinated as speech continuation."""
-        if not ctx or not ctx.summary:
-            return ""
-        # Just a short domain cue, not a word list — prevents hallucination loops
-        return ctx.summary.split(".")[0][:80]

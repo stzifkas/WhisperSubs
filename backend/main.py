@@ -307,21 +307,6 @@ async def ws_endpoint(websocket: WebSocket):
                                                 _translator.maybe_update_context(tx_ctx)
                                             )
 
-                                    # Feed glossary terms back to Whisper as a transcription hint
-                                    hint = _translator.transcription_hint(tx_ctx)
-                                    if hint:
-                                        try:
-                                            cfg: dict = {
-                                                "input_audio_transcription": {
-                                                    "model": config.WHISPER_MODEL,
-                                                    "prompt": hint[:500],
-                                                },
-                                            }
-                                            if whisper_language:
-                                                cfg["input_audio_transcription"]["language"] = whisper_language
-                                            await openai_ws.send(json.dumps({"type": "session.update", "session": cfg}))
-                                        except Exception:
-                                            pass
 
                                 except Exception:
                                     break
