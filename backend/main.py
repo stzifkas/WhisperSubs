@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -14,7 +15,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from . import config
-from .translator import Translator
+from .translator import TranslationContext, Translator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +33,9 @@ _translator = Translator(_openai_client)
 # SRT store: session_id → list of (start_s, end_s, text)
 _srt_sessions: dict[str, list[tuple[float, float, str]]] = {}
 
+# Translation context per session
+_translation_contexts: dict[str, TranslationContext] = {}
+
 
 class ChatSession:
     def __init__(self):
@@ -43,6 +47,14 @@ class ChatSession:
 _chat_sessions: dict[str, ChatSession] = {}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+_GARBAGE_RE = re.compile(r'^[\s#\-_=\.\,\!\?\*\~\[\]\(\)]+$')
+
+def _is_garbage(text: str) -> bool:
+    """Filter Whisper hallucinations: '###', '...', lone punctuation, etc."""
+    stripped = text.strip()
+    return not stripped or bool(_GARBAGE_RE.match(stripped)) or len(stripped) < 2
+
 
 def _fmt_srt_time(s: float) -> str:
     h = int(s // 3600)
@@ -128,10 +140,12 @@ async def chat_endpoint(session_id: str, req: ChatRequest):
         f"[{_fmt_srt_time(s)}-{_fmt_srt_time(e)}] {t}" for s, e, t in recent
     ) or "(no transcript yet)"
 
+    tx_ctx = _translation_contexts.get(session_id)
     system_content = (
         "You are a helpful live assistant. The user is watching/listening to something "
         "and you have access to the live transcript. Answer questions concisely and helpfully.\n\n"
         + (f"Summary of earlier content:\n{chat.summary}\n\n" if chat.summary else "")
+        + (f"Topic/translation context:\n{tx_ctx.summary}\n\n" if tx_ctx and tx_ctx.summary else "")
         + f"Most recent transcript:\n{recent_text}"
     )
 
@@ -167,6 +181,7 @@ async def ws_endpoint(websocket: WebSocket):
     session_id = str(uuid.uuid4())
     _srt_sessions[session_id] = []
     _chat_sessions[session_id] = ChatSession()
+    _translation_contexts[session_id] = TranslationContext()
     logger.info("Client connected, session=%s", session_id)
     await websocket.send_json({"type": "session_id", "id": session_id})
 
@@ -265,7 +280,7 @@ async def ws_endpoint(websocket: WebSocket):
 
                         elif etype == "conversation.item.input_audio_transcription.completed":
                             transcript = event.get("transcript", "").strip()
-                            if transcript:
+                            if transcript and not _is_garbage(transcript):
                                 end_s = time.monotonic() - session_start
                                 _srt_sessions[session_id].append((last_transcript_end_s, end_s, transcript))
                                 last_transcript_end_s = end_s
@@ -276,10 +291,38 @@ async def ws_endpoint(websocket: WebSocket):
                                         "text": transcript,
                                         "lang": whisper_language or "auto",
                                     })
+
+                                    tx_ctx = _translation_contexts.get(session_id)
+
                                     if target_language:
-                                        translation = await _translator.translate(transcript, target_language)
+                                        translation = await _translator.translate(
+                                            transcript, target_language, tx_ctx
+                                        )
                                         if translation:
                                             await websocket.send_json({"type": "translation", "text": translation})
+
+                                        # Background: update translation memory
+                                        if tx_ctx:
+                                            asyncio.create_task(
+                                                _translator.maybe_update_context(tx_ctx)
+                                            )
+
+                                    # Feed glossary terms back to Whisper as a transcription hint
+                                    hint = _translator.transcription_hint(tx_ctx)
+                                    if hint:
+                                        try:
+                                            cfg: dict = {
+                                                "input_audio_transcription": {
+                                                    "model": config.WHISPER_MODEL,
+                                                    "prompt": hint[:500],
+                                                },
+                                            }
+                                            if whisper_language:
+                                                cfg["input_audio_transcription"]["language"] = whisper_language
+                                            await openai_ws.send(json.dumps({"type": "session.update", "session": cfg}))
+                                        except Exception:
+                                            pass
+
                                 except Exception:
                                     break
 
