@@ -286,27 +286,26 @@ async def ws_endpoint(websocket: WebSocket):
                                 last_transcript_end_s = end_s
 
                                 try:
+                                    tx_ctx = _translation_contexts.get(session_id)
+                                    result = await _translator.process(transcript, target_language, tx_ctx)
+
+                                    # Overwrite last SRT entry with refined source
+                                    if _srt_sessions[session_id]:
+                                        s, e, _ = _srt_sessions[session_id][-1]
+                                        _srt_sessions[session_id][-1] = (s, e, result.source)
+
                                     await websocket.send_json({
                                         "type": "transcript",
-                                        "text": transcript,
+                                        "text": result.source,
                                         "lang": whisper_language or "auto",
                                     })
 
-                                    tx_ctx = _translation_contexts.get(session_id)
+                                    if result.translation:
+                                        await websocket.send_json({"type": "translation", "text": result.translation})
 
-                                    if target_language:
-                                        translation = await _translator.translate(
-                                            transcript, target_language, tx_ctx
-                                        )
-                                        if translation:
-                                            await websocket.send_json({"type": "translation", "text": translation})
-
-                                        # Background: update translation memory
-                                        if tx_ctx:
-                                            asyncio.create_task(
-                                                _translator.maybe_update_context(tx_ctx)
-                                            )
-
+                                    # Background: update translation memory
+                                    if tx_ctx:
+                                        asyncio.create_task(_translator.maybe_update_context(tx_ctx))
 
                                 except Exception:
                                     break
