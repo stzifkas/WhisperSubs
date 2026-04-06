@@ -32,7 +32,7 @@ Stream audio from any browser tab or microphone and get live subtitles with sub-
 ## Setup
 
 ```bash
-git clone https://github.com/youruser/whispersubs.git
+git clone https://github.com/stzifkas/whispersubs.git
 cd whispersubs
 
 python3 -m venv .venv

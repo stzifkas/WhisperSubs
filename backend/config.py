@@ -14,5 +14,6 @@ SILENCE_RMS_THRESHOLD: float = float(os.getenv("SILENCE_RMS_THRESHOLD", "200")) 
 NO_SPEECH_THRESHOLD: float = float(os.getenv("NO_SPEECH_THRESHOLD", "0.6"))  # 0.0–1.0
 TRANSLATION_MODEL: str = os.getenv("TRANSLATION_MODEL", "gpt-4o-mini")
 CHAT_MODEL: str = os.getenv("CHAT_MODEL", "gpt-4o-mini")
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 MAX_QUEUE_DEPTH: int = int(os.getenv("MAX_QUEUE_DEPTH", "3"))
 WHISPER_RPM: int = int(os.getenv("WHISPER_RPM", "50"))

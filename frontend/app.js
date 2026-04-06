@@ -124,14 +124,43 @@ let pendingBlock = null;
 let pendingTimer = null;
 const TRANSLATION_WAIT_MS = 3000;
 
+// Accumulates streaming translation tokens before pendingBlock is committed.
+let streamingTranslation = '';
+
 function handleTranscript(text) {
   liveText = '';  // Reset accumulation — completed transcript supersedes deltas
+  streamingTranslation = '';
   flushPending();
   pendingBlock = { transcript: text, translation: null };
   pendingTimer = setTimeout(flushPending, TRANSLATION_WAIT_MS);
 }
 
+function handleTranslationDelta(delta) {
+  streamingTranslation += delta;
+  // Show live streaming translation inside the pending live block
+  let liveBlock = captionsEl.querySelector('.caption-block.live');
+  if (!liveBlock) {
+    // pendingBlock was set but no live block yet — create a temporary one
+    liveBlock = document.createElement('div');
+    liveBlock.className = 'caption-block live';
+    const p = document.createElement('p');
+    p.className = 'transcript';
+    p.textContent = pendingBlock ? pendingBlock.transcript : '';
+    liveBlock.appendChild(p);
+    captionsEl.appendChild(liveBlock);
+  }
+  let trEl = liveBlock.querySelector('.translation.streaming');
+  if (!trEl) {
+    trEl = document.createElement('p');
+    trEl.className = 'translation streaming';
+    liveBlock.appendChild(trEl);
+  }
+  trEl.textContent = streamingTranslation;
+  captionsWrap.scrollTop = captionsWrap.scrollHeight;
+}
+
 function handleTranslation(text) {
+  streamingTranslation = '';
   if (pendingBlock) {
     pendingBlock.translation = text;
     flushPending();
@@ -182,6 +211,9 @@ function connectWS() {
         break;
       case 'transcript':
         handleTranscript(msg.text);
+        break;
+      case 'translation_delta':
+        handleTranslationDelta(msg.delta);
         break;
       case 'translation':
         handleTranslation(msg.text);

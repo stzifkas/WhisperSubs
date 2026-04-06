@@ -1,170 +1,130 @@
-import json
+"""Translation pipeline: thin wrapper around the LangGraph translation graph.
+
+Streams translation tokens through the WebSocket as they are generated,
+then returns the final ProcessResult for SRT storage.
+"""
 import logging
 from dataclasses import dataclass, field
 
-from openai import AsyncOpenAI
+from fastapi import WebSocket
 
-from . import config
+from .translation_graph import SessionContext, TranslationState, translation_graph
 
 logger = logging.getLogger(__name__)
 
 
-class TranslationContext:
-    """Per-session translation memory: rolling summary + glossary of key terms."""
-
-    def __init__(self):
-        self.target_language: str = ""
-        self.summary: str = ""
-        self.glossary: dict[str, str] = {}            # source_term → translated_term
-        self.recent_pairs: list[tuple[str, str]] = [] # (refined_source, translation)
-        self.covered_up_to: int = 0
-        self._updating: bool = False
-
-
 @dataclass
 class ProcessResult:
-    source: str       # refined/corrected source transcription
+    source: str
     translation: str = ""
 
 
-class Translator:
-    def __init__(self, client: AsyncOpenAI):
-        self._client = client
+def make_session_context() -> SessionContext:
+    return SessionContext(
+        summary="",
+        glossary={},
+        recent_pairs=[],
+        covered_up_to=0,
+        target_language="",
+        _updating=False,
+    )
 
-    async def process(
-        self,
-        raw: str,
-        target_language: str,
-        ctx: TranslationContext | None = None,
-    ) -> ProcessResult:
-        """Single GPT call: correct Whisper's transcription + translate.
 
-        If there is no context and no target language, returns the raw text
-        unchanged without making an API call.
-        """
-        if not raw.strip():
-            return ProcessResult(source=raw)
+async def process_and_stream(
+    raw: str,
+    target_language: str,
+    whisper_language: str,
+    session_context: SessionContext,
+    websocket: WebSocket,
+) -> ProcessResult:
+    """Run the refine → translate graph, streaming translation tokens to the WebSocket.
 
-        has_context = bool(ctx and (ctx.summary or ctx.glossary))
+    The `transcript` message is sent to the WebSocket as soon as the refine node
+    completes (before translation streaming begins), so the frontend can create its
+    pending caption block before translation deltas start arriving.
 
-        # Nothing to do — skip the API call entirely
-        if not target_language and not has_context:
-            return ProcessResult(source=raw)
+    Returns ProcessResult with the final refined source and translation.
+    """
+    if not raw.strip():
+        return ProcessResult(source=raw)
 
-        # ── Build prompt ──────────────────────────────────────────────────────
+    has_context = bool(session_context.get("summary") or session_context.get("glossary"))
 
-        if target_language:
-            task = (
-                f"1. Correct: fix any transcription errors in the user's message "
-                f"(misspelled names, mishearings, wrong technical terms). "
-                f"The corrected 'source' must be a faithful correction of what was SAID — "
-                f"never a description, summary, or paraphrase of the topic.\n"
-                f"2. Translate: translate the corrected text to {target_language}.\n\n"
-                f'Return ONLY this JSON: {{"source": "corrected text", "translation": "translated text"}}'
-            )
-        else:
-            task = (
-                "Correct any transcription errors (misspelled names, mishearings, "
-                "wrong technical terms). Keep the original language and meaning. "
-                "The corrected 'source' must be a faithful correction of what was SAID — "
-                "never a description or paraphrase.\n\n"
-                'Return ONLY this JSON: {"source": "corrected text"}'
-            )
+    # Nothing to do. skip the API call entirely
+    if not target_language and not has_context:
+        return ProcessResult(source=raw)
 
-        messages: list[dict] = [{"role": "system", "content": task}]
+    # Handle target language change - reset context memory
+    prev_lang = session_context.get("target_language", "")
+    if prev_lang and prev_lang != target_language:
+        session_context["summary"] = ""
+        session_context["glossary"] = {}
+        session_context["covered_up_to"] = 0
+        session_context["recent_pairs"] = []
+    session_context["target_language"] = target_language
 
-        if has_context:
-            ctx_lines = ["Background context (do NOT reproduce in output):"]
-            if ctx.summary:
-                ctx_lines.append(f"Topic: {ctx.summary}")
-            if ctx.glossary:
-                pairs = "; ".join(f"{s}={t}" for s, t in list(ctx.glossary.items())[:25])
-                ctx_lines.append(f"Terminology: {pairs}")
-            messages.append({"role": "system", "content": "\n".join(ctx_lines)})
+    state: TranslationState = {
+        "raw_transcript": raw,
+        "target_language": target_language,
+        "whisper_language": whisper_language,
+        "session_context": session_context,
+        "refined_source": "",
+        "translation": "",
+    }
 
-        messages.append({"role": "user", "content": raw})
+    refined_source = raw
+    translation_parts: list[str] = []
+    transcript_sent = False
 
-        resp = await self._client.chat.completions.create(
-            model=config.TRANSLATION_MODEL,
-            temperature=0.2,
-            max_tokens=500,
-            messages=messages,
-            response_format={"type": "json_object"},
-        )
+    async for event in translation_graph.astream_events(state, version="v2"):
+        etype = event["event"]
+        name = event.get("name", "")
+        node = event.get("metadata", {}).get("langgraph_node", "")
 
+        # When the refine node finishes, send transcript immediately so the
+        # frontend creates pendingBlock before translation tokens start arriving.
+        if etype == "on_chain_end" and name == "refine":
+            output = event.get("data", {}).get("output", {})
+            if isinstance(output, dict):
+                refined_source = output.get("refined_source", raw) or raw
+            if not transcript_sent:
+                try:
+                    await websocket.send_json({
+                        "type": "transcript",
+                        "text": refined_source,
+                        "lang": whisper_language or "auto",
+                    })
+                    transcript_sent = True
+                except Exception:
+                    pass
+
+        # Stream translation tokens as they arrive from the translate node.
+        # Use metadata["langgraph_node"]. event["name"] is the LLM class name, not the node name.
+        elif etype == "on_chat_model_stream" and node == "translate":
+            chunk = event.get("data", {}).get("chunk")
+            if chunk and chunk.content:
+                translation_parts.append(chunk.content)
+                try:
+                    await websocket.send_json({
+                        "type": "translation_delta",
+                        "delta": chunk.content,
+                    })
+                except Exception:
+                    pass
+
+    translation = "".join(translation_parts).strip()
+
+    # Fallback: if graph exited before refine_node's on_chain_end fired
+    if not transcript_sent:
         try:
-            data = json.loads(resp.choices[0].message.content)
-            refined = data.get("source", raw).strip() or raw
-            translation = data.get("translation", "").strip()
-        except (json.JSONDecodeError, AttributeError):
-            logger.warning("process(): failed to parse JSON response, using raw")
-            return ProcessResult(source=raw)
+            await websocket.send_json({
+                "type": "transcript",
+                "text": refined_source,
+                "lang": whisper_language or "auto",
+            })
+        except Exception:
+            pass
 
-        # Guard: if the model returned something wildly longer than the input it
-        # probably leaked the topic summary instead of correcting the transcript.
-        if len(refined) > len(raw) * 2.5 and len(refined) - len(raw) > 60:
-            logger.warning("process(): source suspiciously long (raw=%d, refined=%d), using raw", len(raw), len(refined))
-            refined = raw
+    session_context["recent_pairs"].append((refined_source, translation))
 
-        if ctx is not None:
-            if ctx.target_language and ctx.target_language != target_language:
-                # Target language changed — reset memory
-                ctx.summary = ""
-                ctx.glossary = {}
-                ctx.covered_up_to = 0
-                ctx.recent_pairs = []
-            ctx.target_language = target_language
-            ctx.recent_pairs.append((refined, translation))
-
-        return ProcessResult(source=refined, translation=translation)
-
-    async def maybe_update_context(self, ctx: TranslationContext) -> None:
-        """Background task: update rolling summary and glossary from recent pairs."""
-        UPDATE_EVERY = 5
-        if len(ctx.recent_pairs) - ctx.covered_up_to < UPDATE_EVERY or ctx._updating:
-            return
-
-        ctx._updating = True
-        try:
-            new_pairs = ctx.recent_pairs[ctx.covered_up_to:]
-            originals = "\n".join(f"- {o}" for o, _ in new_pairs)
-            translations = "\n".join(f"- {t}" for _, t in new_pairs)
-            current_glossary = json.dumps(ctx.glossary, ensure_ascii=False) if ctx.glossary else "{}"
-
-            prompt = (
-                f"You maintain translation memory for a live {ctx.target_language} interpreter.\n\n"
-                + (f"Current summary: {ctx.summary}\n\n" if ctx.summary else "")
-                + f"Existing glossary (JSON): {current_glossary}\n\n"
-                f"Recent source texts:\n{originals}\n\n"
-                f"Their {ctx.target_language} translations:\n{translations}\n\n"
-                "Return JSON only:\n"
-                '{"summary": "...", "glossary": {"source_term": "translation"}}\n\n'
-                "Summary: describe the TOPIC in 1-2 sentences "
-                "(e.g. 'A political debate about anarchism and the state', "
-                "'A cooking tutorial about pasta carbonara'). "
-                "Never describe the translation task itself.\n"
-                "Glossary: only proper nouns, names, and domain-specific terms "
-                "that recur. No common words. Merge with existing entries."
-            )
-
-            resp = await self._client.chat.completions.create(
-                model=config.TRANSLATION_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=600,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-
-            data = json.loads(resp.choices[0].message.content)
-            ctx.summary = data.get("summary", ctx.summary)
-            ctx.glossary.update(data.get("glossary", {}))
-            ctx.covered_up_to = len(ctx.recent_pairs)
-            logger.info(
-                "Translation context updated: %d glossary terms, summary=%r",
-                len(ctx.glossary), ctx.summary[:80],
-            )
-
-        except Exception as exc:
-            logger.warning("Translation context update failed: %s", exc)
-        finally:
-            ctx._updating = False
+    return ProcessResult(source=refined_source, translation=translation)

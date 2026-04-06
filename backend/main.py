@@ -15,7 +15,10 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from . import config
-from .translator import TranslationContext, Translator
+from .context_extractor import maybe_update_context
+from .translator import ProcessResult, make_session_context, process_and_stream
+from .translation_graph import SessionContext
+from .vector_store import add_segment, remove_store, search_segments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,7 +29,6 @@ app = FastAPI(title="WhisperSubs")
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 _openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
-_translator = Translator(_openai_client)
 
 # ── Session storage ───────────────────────────────────────────────────────────
 
@@ -34,7 +36,7 @@ _translator = Translator(_openai_client)
 _srt_sessions: dict[str, list[tuple[float, float, str]]] = {}
 
 # Translation context per session
-_translation_contexts: dict[str, TranslationContext] = {}
+_session_contexts: dict[str, SessionContext] = {}
 
 
 class ChatSession:
@@ -135,18 +137,16 @@ async def chat_endpoint(session_id: str, req: ChatRequest):
 
     asyncio.create_task(_maybe_summarize(session_id))
 
-    recent = srt[-10:]
-    recent_text = "\n".join(
-        f"[{_fmt_srt_time(s)}-{_fmt_srt_time(e)}] {t}" for s, e, t in recent
-    ) or "(no transcript yet)"
+    relevant = await search_segments(session_id, req.message, k=6)
+    recent_text = "\n".join(relevant) or "(no transcript yet)"
 
-    tx_ctx = _translation_contexts.get(session_id)
+    tx_ctx = _session_contexts.get(session_id)
     system_content = (
         "You are a helpful live assistant. The user is watching/listening to something "
         "and you have access to the live transcript. Answer questions concisely and helpfully.\n\n"
         + (f"Summary of earlier content:\n{chat.summary}\n\n" if chat.summary else "")
-        + (f"Topic/translation context:\n{tx_ctx.summary}\n\n" if tx_ctx and tx_ctx.summary else "")
-        + f"Most recent transcript:\n{recent_text}"
+        + (f"Topic/translation context:\n{tx_ctx['summary']}\n\n" if tx_ctx and tx_ctx.get("summary") else "")
+        + f"Most relevant transcript segments:\n{recent_text}"
     )
 
     chat.history.append({"role": "user", "content": req.message})
@@ -181,7 +181,7 @@ async def ws_endpoint(websocket: WebSocket):
     session_id = str(uuid.uuid4())
     _srt_sessions[session_id] = []
     _chat_sessions[session_id] = ChatSession()
-    _translation_contexts[session_id] = TranslationContext()
+    _session_contexts[session_id] = make_session_context()
     logger.info("Client connected, session=%s", session_id)
     await websocket.send_json({"type": "session_id", "id": session_id})
 
@@ -286,26 +286,30 @@ async def ws_endpoint(websocket: WebSocket):
                                 last_transcript_end_s = end_s
 
                                 try:
-                                    tx_ctx = _translation_contexts.get(session_id)
-                                    result = await _translator.process(transcript, target_language, tx_ctx)
+                                    ctx = _session_contexts.get(session_id)
+                                    result = await process_and_stream(
+                                        transcript, target_language, whisper_language, ctx, websocket
+                                    )
 
                                     # Overwrite last SRT entry with refined source
                                     if _srt_sessions[session_id]:
                                         s, e, _ = _srt_sessions[session_id][-1]
                                         _srt_sessions[session_id][-1] = (s, e, result.source)
 
-                                    await websocket.send_json({
-                                        "type": "transcript",
-                                        "text": result.source,
-                                        "lang": whisper_language or "auto",
-                                    })
-
+                                    # transcript message was already sent by process_and_stream
                                     if result.translation:
                                         await websocket.send_json({"type": "translation", "text": result.translation})
 
-                                    # Background: update translation memory
-                                    if tx_ctx:
-                                        asyncio.create_task(_translator.maybe_update_context(tx_ctx))
+                                    # Background tasks: update context memory + vector store
+                                    if ctx:
+                                        asyncio.create_task(maybe_update_context(ctx))
+                                    segment_end_s = end_s
+                                    segment_start_s = last_transcript_end_s - (end_s - last_transcript_end_s) if last_transcript_end_s != end_s else 0.0
+                                    asyncio.create_task(add_segment(
+                                        session_id,
+                                        result.source,
+                                        {"start_s": segment_start_s, "end_s": segment_end_s},
+                                    ))
 
                                 except Exception:
                                     break
@@ -332,4 +336,5 @@ async def ws_endpoint(websocket: WebSocket):
         except Exception:
             pass
     finally:
+        remove_store(session_id)
         logger.info("Client disconnected, session=%s", session_id)
