@@ -35,10 +35,13 @@ class TranslationState(TypedDict):
     target_language: str
     whisper_language: str
     session_context: SessionContext
-    confidence: float | None         # geometric mean token probability; None = unknown
-    logprobs: list[dict] | None      # raw token logprobs from Realtime API; None = unavailable
-    refined_source: str              # populated by refine_node
-    translation: str                 # populated by translate_node
+    confidence: float | None           # geometric mean token probability; None = unknown
+    logprobs: list[dict] | None        # raw token logprobs from Realtime API; None = unavailable
+    refinement_low_threshold: float    # spans below this are always repaired
+    refinement_high_risk_threshold: float  # high-risk spans below this are repaired
+    correction_aggressiveness: str     # "low" | "medium" | "high"
+    refined_source: str                # populated by refine_node
+    translation: str                   # populated by translate_node
 
 
 
@@ -82,18 +85,36 @@ _translate_prompt = ChatPromptTemplate.from_messages([
 ])
 
 
-def _build_context_block(ctx: SessionContext, confidence: float | None = None) -> str:
+def _build_context_block(
+    ctx: SessionContext,
+    confidence: float | None = None,
+    correction_aggressiveness: str = "medium",
+) -> str:
     lines = []
-    level = confidence_level(confidence)
-    if level == "low":
+
+    if correction_aggressiveness == "high":
         lines.append(
-            "Transcription confidence is LOW — the model was uncertain about many tokens. "
-            "Be especially thorough: fix likely mishearings, wrong names, and garbled words."
+            "Be aggressive — fix mishearings, wrong names, garbled text, and borderline cases. "
+            "Err on the side of correcting over preserving."
         )
-    elif level == "high":
+    elif correction_aggressiveness == "low":
         lines.append(
-            "Transcription confidence is HIGH — make only clear, unambiguous corrections."
+            "Be conservative — fix only clear, unambiguous transcription errors. "
+            "When uncertain, preserve the original text exactly."
         )
+    else:
+        # medium: let confidence signal guide the correction intensity
+        level = confidence_level(confidence)
+        if level == "low":
+            lines.append(
+                "Transcription confidence is LOW — be thorough: fix likely mishearings, "
+                "wrong names, and garbled words."
+            )
+        elif level == "high":
+            lines.append(
+                "Transcription confidence is HIGH — make only clear, unambiguous corrections."
+            )
+
     if ctx.get("summary"):
         lines.append(f"Topic: {ctx['summary']}")
     if ctx.get("glossary"):
@@ -119,8 +140,8 @@ async def refine_node(state: TranslationState) -> dict:
     annotated = annotate_transcript(
         raw,
         spans,
-        low_threshold=config.REFINEMENT_LOW_CONFIDENCE_THRESHOLD,
-        high_risk_threshold=config.REFINEMENT_HIGH_RISK_THRESHOLD,
+        low_threshold=state.get("refinement_low_threshold", config.REFINEMENT_LOW_CONFIDENCE_THRESHOLD),
+        high_risk_threshold=state.get("refinement_high_risk_threshold", config.REFINEMENT_HIGH_RISK_THRESHOLD),
     )
 
     # Nothing flagged — skip the LLM call entirely
@@ -131,7 +152,11 @@ async def refine_node(state: TranslationState) -> dict:
     repairable_count = annotated.count("[REPAIR:")
     logger.debug("refine_node: %d span(s) marked for repair", repairable_count)
 
-    context_block = _build_context_block(ctx, state.get("confidence"))
+    context_block = _build_context_block(
+        ctx,
+        state.get("confidence"),
+        state.get("correction_aggressiveness", "medium"),
+    )
 
     chain = _refine_prompt | _refine_llm.with_structured_output(
         RefinementOutput,

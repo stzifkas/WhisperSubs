@@ -17,14 +17,13 @@ from pydantic import BaseModel
 from . import config
 from .confidence import confidence_level, parse_confidence
 from .context_extractor import maybe_update_context
-from .revision_policy import (
-    DEFAULT_BUDGETS,
-    RevisionBudget,
-    RevisionMode,
-    SubtitleRevisionTracker,
-    SubtitleState,
-    log_decision,
+from .interpreter_modes import (
+    DEFAULT_MODE,
+    InterpreterMode,
+    MODE_PROFILES,
+    SessionPolicy,
 )
+from .revision_policy import SubtitleState, log_decision
 from .translator import ProcessResult, make_session_context, process_and_stream
 from .translation_graph import SessionContext
 from .vector_store import add_segment, remove_store, search_segments
@@ -65,18 +64,8 @@ _srt_sessions: dict[str, list[SRTSegment]] = {}
 # Translation context per session
 _session_contexts: dict[str, SessionContext] = {}
 
-# Subtitle revision trackers per session
-_revision_trackers: dict[str, SubtitleRevisionTracker] = {}
-
-
-def _make_revision_tracker() -> SubtitleRevisionTracker:
-    mode = RevisionMode(config.REVISION_MODE)
-    default = DEFAULT_BUDGETS[mode]
-    budget = RevisionBudget(
-        max_age_s=config.REVISION_MAX_AGE_S or default.max_age_s,
-        max_segments_back=config.REVISION_MAX_SEGMENTS_BACK or default.max_segments_back,
-    )
-    return SubtitleRevisionTracker(mode=mode, budget=budget)
+# Session interpreter policies (mode profile + revision tracker)
+_session_policies: dict[str, SessionPolicy] = {}
 
 
 class ChatSession:
@@ -222,7 +211,9 @@ async def ws_endpoint(websocket: WebSocket):
     _srt_sessions[session_id] = []
     _chat_sessions[session_id] = ChatSession()
     _session_contexts[session_id] = make_session_context()
-    _revision_trackers[session_id] = _make_revision_tracker()
+    _session_policies[session_id] = SessionPolicy.create(
+        InterpreterMode(config.DEFAULT_INTERPRETER_MODE)
+    )
     logger.info("Client connected, session=%s", session_id)
     await websocket.send_json({"type": "session_id", "id": session_id})
 
@@ -297,6 +288,19 @@ async def ws_endpoint(websocket: WebSocket):
                                         "Config: lang=%r src=%r vad=%.2f silence_ms=%d",
                                         target_language, whisper_language, vad_threshold, silence_duration_ms,
                                     )
+                                elif data.get("type") == "mode":
+                                    raw_mode = data.get("mode", "")
+                                    try:
+                                        new_mode = InterpreterMode(raw_mode)
+                                        policy = _session_policies.get(session_id)
+                                        if policy:
+                                            policy.switch_to(new_mode)
+                                            logger.info(
+                                                "Mode switched to %r for session=%s",
+                                                new_mode.value, session_id,
+                                            )
+                                    except ValueError:
+                                        logger.warning("Unknown interpreter mode: %r", raw_mode)
                             except json.JSONDecodeError:
                                 pass
 
@@ -339,11 +343,11 @@ async def ws_endpoint(websocket: WebSocket):
                                 )
 
                                 # ── Revision policy check ─────────────────────
-                                tracker = _revision_trackers.get(session_id)
-                                if tracker:
-                                    tracker.register(segment_index)
-                                    decision = tracker.decide_revision(segment_index)
-                                    log_decision(decision, tracker.mode, session_id)
+                                policy = _session_policies.get(session_id)
+                                if policy:
+                                    policy.tracker.register(segment_index)
+                                    decision = policy.tracker.decide_revision(segment_index)
+                                    log_decision(decision, policy.tracker.mode, session_id)
                                 else:
                                     decision = None
 
@@ -352,21 +356,34 @@ async def ws_endpoint(websocket: WebSocket):
 
                                     if decision is None or decision.allowed:
                                         # ── Revision allowed: refine + translate ──
+                                        profile = policy.profile if policy else None
                                         result = await process_and_stream(
                                             transcript, target_language, whisper_language,
                                             ctx, websocket,
                                             confidence=confidence,
                                             logprobs=event.get("logprobs"),
+                                            refinement_low_threshold=(
+                                                profile.refinement_low_threshold if profile
+                                                else config.REFINEMENT_LOW_CONFIDENCE_THRESHOLD
+                                            ),
+                                            refinement_high_risk_threshold=(
+                                                profile.refinement_high_risk_threshold if profile
+                                                else config.REFINEMENT_HIGH_RISK_THRESHOLD
+                                            ),
+                                            correction_aggressiveness=(
+                                                profile.correction_aggressiveness if profile
+                                                else "medium"
+                                            ),
                                         )
                                         final_state = SubtitleState.STABLE
-                                        if tracker:
-                                            tracker.transition(segment_index, SubtitleState.STABLE)
+                                        if policy:
+                                            policy.tracker.transition(segment_index, SubtitleState.STABLE)
                                     else:
                                         # ── Revision blocked: emit raw text as-is ──
                                         result = ProcessResult(source=transcript)
                                         final_state = SubtitleState.LOCKED
-                                        if tracker:
-                                            tracker.transition(segment_index, SubtitleState.LOCKED)
+                                        if policy:
+                                            policy.tracker.transition(segment_index, SubtitleState.LOCKED)
                                         await websocket.send_json({
                                             "type": "transcript",
                                             "text": transcript,
@@ -418,5 +435,5 @@ async def ws_endpoint(websocket: WebSocket):
             pass
     finally:
         remove_store(session_id)
-        _revision_trackers.pop(session_id, None)
+        _session_policies.pop(session_id, None)
         logger.info("Client disconnected, session=%s", session_id)

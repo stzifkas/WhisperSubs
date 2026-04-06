@@ -6,6 +6,16 @@ const startBtn = document.getElementById('start-btn');
 const audioSourceSelect = document.getElementById('audio-source-select');
 const srcLangSelect = document.getElementById('src-lang-select');
 const langSelect = document.getElementById('lang-select');
+const modeSelect = document.getElementById('mode-select');
+
+// Commit delay by mode — how long to wait for translation before showing
+// source caption on its own. Must mirror ModeProfile.commit_delay_ms in backend.
+const MODE_COMMIT_DELAY_MS = {
+  fast:      500,
+  balanced:  2000,
+  broadcast: 800,
+  precision: 3000,
+};
 const captionsEl = document.getElementById('captions');
 const captionsWrap = document.getElementById('captions-wrap');
 const micLevelWrap = document.getElementById('mic-level-wrap');
@@ -122,7 +132,7 @@ function animateMicLevel() {
 
 let pendingBlock = null;
 let pendingTimer = null;
-const TRANSLATION_WAIT_MS = 3000;
+let TRANSLATION_WAIT_MS = MODE_COMMIT_DELAY_MS[modeSelect.value] ?? 2000;
 
 // Accumulates streaming translation tokens before pendingBlock is committed.
 let streamingTranslation = '';
@@ -185,6 +195,7 @@ function connectWS() {
   ws.onopen = () => {
     setStatus('Connected', 'connected');
     sendConfig();
+    sendMode();
   };
 
   ws.onclose = () => {
@@ -458,6 +469,11 @@ function sendConfig() {
   }));
 }
 
+function sendMode() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'mode', mode: modeSelect.value }));
+}
+
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
 function appendChatMsg(text, role) {
@@ -507,6 +523,11 @@ startBtn.addEventListener('click', () => {
 
 langSelect.addEventListener('change', sendConfig);
 srcLangSelect.addEventListener('change', sendConfig);
+
+modeSelect.addEventListener('change', () => {
+  TRANSLATION_WAIT_MS = MODE_COMMIT_DELAY_MS[modeSelect.value] ?? 2000;
+  sendMode();
+});
 
 advancedBtn.addEventListener('click', () => {
   advancedPanel.classList.toggle('open');

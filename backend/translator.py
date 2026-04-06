@@ -38,6 +38,9 @@ async def process_and_stream(
     websocket: WebSocket,
     confidence: float | None = None,
     logprobs: list[dict] | None = None,
+    refinement_low_threshold: float = 0.55,
+    refinement_high_risk_threshold: float = 0.80,
+    correction_aggressiveness: str = "medium",
 ) -> ProcessResult:
     """Run the refine → translate graph, streaming translation tokens to the WebSocket.
 
@@ -81,6 +84,9 @@ async def process_and_stream(
         "session_context": session_context,
         "confidence": confidence,
         "logprobs": logprobs,
+        "refinement_low_threshold": refinement_low_threshold,
+        "refinement_high_risk_threshold": refinement_high_risk_threshold,
+        "correction_aggressiveness": correction_aggressiveness,
         "refined_source": "",
         "translation": "",
     }

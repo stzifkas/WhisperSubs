@@ -23,6 +23,11 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 REFINEMENT_LOW_CONFIDENCE_THRESHOLD: float = float(os.getenv("REFINEMENT_LOW_CONFIDENCE_THRESHOLD", "0.55"))
 REFINEMENT_HIGH_RISK_THRESHOLD: float = float(os.getenv("REFINEMENT_HIGH_RISK_THRESHOLD", "0.80"))
 
+# Interpreter mode: fast | balanced | broadcast | precision
+# Controls all policy parameters (refinement thresholds, correction aggressiveness,
+# revision budget) as a single named preset.
+DEFAULT_INTERPRETER_MODE: str = os.getenv("DEFAULT_INTERPRETER_MODE", "balanced")
+
 # Subtitle revision policy
 # Mode controls the default budget window: strict | balanced | relaxed
 REVISION_MODE: str = os.getenv("REVISION_MODE", "balanced")
