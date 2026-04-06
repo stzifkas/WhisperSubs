@@ -16,6 +16,7 @@ from typing_extensions import TypedDict
 
 from . import config
 from .confidence import confidence_level
+from .glossary_enforcer import check_and_repair
 from .span_classifier import annotate_transcript, classify_spans
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,8 @@ class TranslationState(TypedDict):
     refinement_high_risk_threshold: float  # high-risk spans below this are repaired
     correction_aggressiveness: str     # "low" | "medium" | "high"
     refined_source: str                # populated by refine_node
-    translation: str                   # populated by translate_node
+    translation: str                   # populated by translate_node / glossary_check_node
+    glossary_violations: list[dict]    # populated by glossary_check_node
 
 
 
@@ -181,6 +183,23 @@ async def refine_node(state: TranslationState) -> dict:
     return {"refined_source": refined}
 
 
+async def glossary_check_node(state: TranslationState) -> dict:
+    """Detect glossary violations in the translation and repair only affected spans."""
+    glossary = state["session_context"].get("glossary", {})
+    translation = state.get("translation", "")
+    source = state.get("refined_source", "")
+
+    result = await check_and_repair(source, translation, glossary)
+
+    return {
+        "translation": result.translation,
+        "glossary_violations": [
+            {"source_term": v.source_term, "expected_target": v.expected_target}
+            for v in result.violations
+        ],
+    }
+
+
 async def translate_node(state: TranslationState) -> dict:
     ctx = state["session_context"]
     glossary_hint = _build_glossary_hint(ctx)
@@ -205,11 +224,13 @@ def route_translation(state: TranslationState) -> Literal["translate", "__end__"
 _builder = StateGraph(TranslationState)
 _builder.add_node("refine", refine_node)
 _builder.add_node("translate", translate_node)
+_builder.add_node("glossary_check", glossary_check_node)
 _builder.add_edge(START, "refine")
 _builder.add_conditional_edges("refine", route_translation, {
     "translate": "translate",
     "__end__": END,
 })
-_builder.add_edge("translate", END)
+_builder.add_edge("translate", "glossary_check")
+_builder.add_edge("glossary_check", END)
 
 translation_graph = _builder.compile()

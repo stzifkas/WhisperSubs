@@ -89,11 +89,14 @@ async def process_and_stream(
         "correction_aggressiveness": correction_aggressiveness,
         "refined_source": "",
         "translation": "",
+        "glossary_violations": [],
     }
 
     refined_source = raw
     translation_parts: list[str] = []
     transcript_sent = False
+    # Set when glossary_check_node completes; authoritative over translation_parts.
+    glossary_checked_translation: str | None = None
 
     async for event in translation_graph.astream_events(state, version="v2"):
         etype = event["event"]
@@ -132,7 +135,20 @@ async def process_and_stream(
                 except Exception:
                     pass
 
-    translation = "".join(translation_parts).strip()
+        # glossary_check_node is authoritative: use its translation (may be
+        # repaired) instead of the raw streamed tokens.
+        elif etype == "on_chain_end" and name == "glossary_check":
+            output = event.get("data", {}).get("output", {})
+            if isinstance(output, dict):
+                glossary_checked_translation = output.get("translation", "")
+
+    # Prefer the post-repair translation from glossary_check_node; fall back
+    # to the raw accumulated tokens if the node didn't run (no target language).
+    translation = (
+        glossary_checked_translation
+        if glossary_checked_translation is not None
+        else "".join(translation_parts).strip()
+    )
 
     # Fallback: if graph exited before refine_node's on_chain_end fired
     if not transcript_sent:
