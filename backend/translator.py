@@ -36,6 +36,8 @@ async def process_and_stream(
     whisper_language: str,
     session_context: SessionContext,
     websocket: WebSocket,
+    confidence: float | None = None,
+    logprobs: list[dict] | None = None,
 ) -> ProcessResult:
     """Run the refine → translate graph, streaming translation tokens to the WebSocket.
 
@@ -50,8 +52,17 @@ async def process_and_stream(
 
     has_context = bool(session_context.get("summary") or session_context.get("glossary"))
 
-    # Nothing to do. skip the API call entirely
+    # Nothing to do — skip the LLM entirely, but still send the transcript message
     if not target_language and not has_context:
+        try:
+            await websocket.send_json({
+                "type": "transcript",
+                "text": raw,
+                "lang": whisper_language or "auto",
+                "subtitle_state": "stable",
+            })
+        except Exception:
+            pass
         return ProcessResult(source=raw)
 
     # Handle target language change - reset context memory
@@ -68,6 +79,8 @@ async def process_and_stream(
         "target_language": target_language,
         "whisper_language": whisper_language,
         "session_context": session_context,
+        "confidence": confidence,
+        "logprobs": logprobs,
         "refined_source": "",
         "translation": "",
     }
@@ -93,6 +106,7 @@ async def process_and_stream(
                         "type": "transcript",
                         "text": refined_source,
                         "lang": whisper_language or "auto",
+                        "subtitle_state": "stable",
                     })
                     transcript_sent = True
                 except Exception:
@@ -121,6 +135,7 @@ async def process_and_stream(
                 "type": "transcript",
                 "text": refined_source,
                 "lang": whisper_language or "auto",
+                "subtitle_state": "stable",
             })
         except Exception:
             pass

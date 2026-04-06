@@ -15,5 +15,21 @@ NO_SPEECH_THRESHOLD: float = float(os.getenv("NO_SPEECH_THRESHOLD", "0.6"))  # 0
 TRANSLATION_MODEL: str = os.getenv("TRANSLATION_MODEL", "gpt-4o-mini")
 CHAT_MODEL: str = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+# Selective refinement thresholds (span-level)
+# Spans with token confidence below LOW are always repaired.
+# High-risk spans (proper nouns, acronyms, numbers, dates) are repaired when
+# confidence is below HIGH_RISK (a looser threshold to catch misheard names/numbers).
+REFINEMENT_LOW_CONFIDENCE_THRESHOLD: float = float(os.getenv("REFINEMENT_LOW_CONFIDENCE_THRESHOLD", "0.55"))
+REFINEMENT_HIGH_RISK_THRESHOLD: float = float(os.getenv("REFINEMENT_HIGH_RISK_THRESHOLD", "0.80"))
+
+# Subtitle revision policy
+# Mode controls the default budget window: strict | balanced | relaxed
+REVISION_MODE: str = os.getenv("REVISION_MODE", "balanced")
+# Optional overrides (0 = use mode default)
+_REVISION_MAX_AGE_S  = float(os.getenv("REVISION_MAX_AGE_S", "0"))
+_REVISION_MAX_SEGS   = int(os.getenv("REVISION_MAX_SEGMENTS_BACK", "0"))
+REVISION_MAX_AGE_S: float | None          = _REVISION_MAX_AGE_S  or None
+REVISION_MAX_SEGMENTS_BACK: int | None    = _REVISION_MAX_SEGS   or None
 MAX_QUEUE_DEPTH: int = int(os.getenv("MAX_QUEUE_DEPTH", "3"))
 WHISPER_RPM: int = int(os.getenv("WHISPER_RPM", "50"))

@@ -15,6 +15,8 @@ from pydantic import BaseModel
 from typing_extensions import TypedDict
 
 from . import config
+from .confidence import confidence_level
+from .span_classifier import annotate_transcript, classify_spans
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +35,10 @@ class TranslationState(TypedDict):
     target_language: str
     whisper_language: str
     session_context: SessionContext
-    refined_source: str   # populated by refine_node
-    translation: str      # populated by translate_node
+    confidence: float | None         # geometric mean token probability; None = unknown
+    logprobs: list[dict] | None      # raw token logprobs from Realtime API; None = unavailable
+    refined_source: str              # populated by refine_node
+    translation: str                 # populated by translate_node
 
 
 
@@ -59,11 +63,14 @@ _translate_llm = ChatOpenAI(
 
 _refine_prompt = ChatPromptTemplate.from_messages([
     ("system",
-     "You correct live speech transcription errors. Fix mishearings, wrong technical terms, "
-     "and misheard proper names. The corrected source must be a faithful correction of what was SAID. "
-     "never a description, summary, or paraphrase of the topic. Keep the original language.\n"
+     "You are correcting a live speech transcript. "
+     "Spans marked [REPAIR: ...] contain uncertain or high-risk text (wrong names, mishearings, "
+     "garbled numbers, or misheard acronyms). "
+     "Fix ONLY the text inside each [REPAIR: ...] marker — replace it with your correction. "
+     "Leave all unmarked text exactly as written, character for character. "
+     "Return the complete transcript with every [REPAIR: ...] resolved.\n"
      "{context_block}"),
-    ("human", "{raw_transcript}"),
+    ("human", "{annotated_transcript}"),
 ])
 
 _translate_prompt = ChatPromptTemplate.from_messages([
@@ -75,8 +82,18 @@ _translate_prompt = ChatPromptTemplate.from_messages([
 ])
 
 
-def _build_context_block(ctx: SessionContext) -> str:
+def _build_context_block(ctx: SessionContext, confidence: float | None = None) -> str:
     lines = []
+    level = confidence_level(confidence)
+    if level == "low":
+        lines.append(
+            "Transcription confidence is LOW — the model was uncertain about many tokens. "
+            "Be especially thorough: fix likely mishearings, wrong names, and garbled words."
+        )
+    elif level == "high":
+        lines.append(
+            "Transcription confidence is HIGH — make only clear, unambiguous corrections."
+        )
     if ctx.get("summary"):
         lines.append(f"Topic: {ctx['summary']}")
     if ctx.get("glossary"):
@@ -95,8 +112,26 @@ def _build_glossary_hint(ctx: SessionContext) -> str:
 
 
 async def refine_node(state: TranslationState) -> dict:
+    raw = state["raw_transcript"]
     ctx = state["session_context"]
-    context_block = _build_context_block(ctx)
+
+    spans = classify_spans(raw, state.get("logprobs"))
+    annotated = annotate_transcript(
+        raw,
+        spans,
+        low_threshold=config.REFINEMENT_LOW_CONFIDENCE_THRESHOLD,
+        high_risk_threshold=config.REFINEMENT_HIGH_RISK_THRESHOLD,
+    )
+
+    # Nothing flagged — skip the LLM call entirely
+    if annotated is None:
+        logger.debug("refine_node: all spans protected, skipping LLM")
+        return {"refined_source": raw}
+
+    repairable_count = annotated.count("[REPAIR:")
+    logger.debug("refine_node: %d span(s) marked for repair", repairable_count)
+
+    context_block = _build_context_block(ctx, state.get("confidence"))
 
     chain = _refine_prompt | _refine_llm.with_structured_output(
         RefinementOutput,
@@ -104,17 +139,16 @@ async def refine_node(state: TranslationState) -> dict:
     ).with_retry(stop_after_attempt=2)
 
     result: RefinementOutput = await chain.ainvoke({
-        "raw_transcript": state["raw_transcript"],
+        "annotated_transcript": annotated,
         "context_block": context_block,
     })
 
-    refined = result.source.strip() or state["raw_transcript"]
+    refined = result.source.strip() or raw
 
-    # Guard: reject if model leaked topic summary into the source text
-    raw = state["raw_transcript"]
+    # Guard: reject if model leaked topic context into the output
     if len(refined) > len(raw) * 2.5 and len(refined) - len(raw) > 60:
         logger.warning(
-            "refine_node: source suspiciously long (raw=%d, refined=%d), using raw",
+            "refine_node: output suspiciously long (raw=%d, refined=%d), using raw",
             len(raw), len(refined),
         )
         refined = raw

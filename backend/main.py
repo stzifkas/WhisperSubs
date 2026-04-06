@@ -15,7 +15,16 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from . import config
+from .confidence import confidence_level, parse_confidence
 from .context_extractor import maybe_update_context
+from .revision_policy import (
+    DEFAULT_BUDGETS,
+    RevisionBudget,
+    RevisionMode,
+    SubtitleRevisionTracker,
+    SubtitleState,
+    log_decision,
+)
 from .translator import ProcessResult, make_session_context, process_and_stream
 from .translation_graph import SessionContext
 from .vector_store import add_segment, remove_store, search_segments
@@ -32,11 +41,42 @@ _openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 
 # ── Session storage ───────────────────────────────────────────────────────────
 
-# SRT store: session_id → list of (start_s, end_s, text)
-_srt_sessions: dict[str, list[tuple[float, float, str]]] = {}
+class SRTSegment:
+    __slots__ = ("start_s", "end_s", "text", "confidence", "state")
+
+    def __init__(
+        self,
+        start_s: float,
+        end_s: float,
+        text: str,
+        confidence: float | None = None,
+        state: SubtitleState = SubtitleState.TENTATIVE,
+    ):
+        self.start_s = start_s
+        self.end_s = end_s
+        self.text = text
+        self.confidence = confidence  # geometric mean token probability; None = unknown
+        self.state = state
+
+
+# SRT store: session_id → list of SRTSegment
+_srt_sessions: dict[str, list[SRTSegment]] = {}
 
 # Translation context per session
 _session_contexts: dict[str, SessionContext] = {}
+
+# Subtitle revision trackers per session
+_revision_trackers: dict[str, SubtitleRevisionTracker] = {}
+
+
+def _make_revision_tracker() -> SubtitleRevisionTracker:
+    mode = RevisionMode(config.REVISION_MODE)
+    default = DEFAULT_BUDGETS[mode]
+    budget = RevisionBudget(
+        max_age_s=config.REVISION_MAX_AGE_S or default.max_age_s,
+        max_segments_back=config.REVISION_MAX_SEGMENTS_BACK or default.max_segments_back,
+    )
+    return SubtitleRevisionTracker(mode=mode, budget=budget)
 
 
 class ChatSession:
@@ -66,10 +106,10 @@ def _fmt_srt_time(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
 
-def _build_srt(entries: list[tuple[float, float, str]]) -> str:
+def _build_srt(entries: list[SRTSegment]) -> str:
     blocks = []
-    for i, (start_s, end_s, text) in enumerate(entries, 1):
-        blocks.append(f"{i}\n{_fmt_srt_time(start_s)} --> {_fmt_srt_time(end_s)}\n{text}\n")
+    for i, seg in enumerate(entries, 1):
+        blocks.append(f"{i}\n{_fmt_srt_time(seg.start_s)} --> {_fmt_srt_time(seg.end_s)}\n{seg.text}\n")
     return "\n".join(blocks)
 
 
@@ -88,7 +128,7 @@ async def _maybe_summarize(session_id: str) -> None:
     compress_up_to = len(srt) - KEEP_RECENT
     chunk = srt[chat.summary_covered_up_to:compress_up_to]
     text_block = "\n".join(
-        f"[{_fmt_srt_time(s)}-{_fmt_srt_time(e)}] {t}" for s, e, t in chunk
+        f"[{_fmt_srt_time(seg.start_s)}-{_fmt_srt_time(seg.end_s)}] {seg.text}" for seg in chunk
     )
     prompt = (
         "You are maintaining a rolling notes scratchpad for an ongoing live transcription.\n"
@@ -182,6 +222,7 @@ async def ws_endpoint(websocket: WebSocket):
     _srt_sessions[session_id] = []
     _chat_sessions[session_id] = ChatSession()
     _session_contexts[session_id] = make_session_context()
+    _revision_trackers[session_id] = _make_revision_tracker()
     logger.info("Client connected, session=%s", session_id)
     await websocket.send_json({"type": "session_id", "id": session_id})
 
@@ -213,6 +254,7 @@ async def ws_endpoint(websocket: WebSocket):
                         "prefix_padding_ms": 300,
                         "silence_duration_ms": max(200, silence_duration_ms),
                     },
+                    "include": ["item.input_audio_transcription.logprobs"],
                 }
                 if whisper_language:
                     cfg["input_audio_transcription"]["language"] = whisper_language
@@ -281,34 +323,73 @@ async def ws_endpoint(websocket: WebSocket):
                         elif etype == "conversation.item.input_audio_transcription.completed":
                             transcript = event.get("transcript", "").strip()
                             if transcript and not _is_garbage(transcript):
+                                confidence = parse_confidence(event.get("logprobs"))
                                 end_s = time.monotonic() - session_start
-                                _srt_sessions[session_id].append((last_transcript_end_s, end_s, transcript))
+                                seg_start_s = last_transcript_end_s
+                                srt = _srt_sessions[session_id]
+                                srt.append(SRTSegment(seg_start_s, end_s, transcript, confidence))
+                                segment_index = len(srt) - 1
                                 last_transcript_end_s = end_s
+                                logger.info(
+                                    "Transcript seg=%d confidence=%.3f (%s): %r",
+                                    segment_index,
+                                    confidence if confidence is not None else float("nan"),
+                                    confidence_level(confidence),
+                                    transcript[:60],
+                                )
+
+                                # ── Revision policy check ─────────────────────
+                                tracker = _revision_trackers.get(session_id)
+                                if tracker:
+                                    tracker.register(segment_index)
+                                    decision = tracker.decide_revision(segment_index)
+                                    log_decision(decision, tracker.mode, session_id)
+                                else:
+                                    decision = None
 
                                 try:
                                     ctx = _session_contexts.get(session_id)
-                                    result = await process_and_stream(
-                                        transcript, target_language, whisper_language, ctx, websocket
-                                    )
 
-                                    # Overwrite last SRT entry with refined source
-                                    if _srt_sessions[session_id]:
-                                        s, e, _ = _srt_sessions[session_id][-1]
-                                        _srt_sessions[session_id][-1] = (s, e, result.source)
+                                    if decision is None or decision.allowed:
+                                        # ── Revision allowed: refine + translate ──
+                                        result = await process_and_stream(
+                                            transcript, target_language, whisper_language,
+                                            ctx, websocket,
+                                            confidence=confidence,
+                                            logprobs=event.get("logprobs"),
+                                        )
+                                        final_state = SubtitleState.STABLE
+                                        if tracker:
+                                            tracker.transition(segment_index, SubtitleState.STABLE)
+                                    else:
+                                        # ── Revision blocked: emit raw text as-is ──
+                                        result = ProcessResult(source=transcript)
+                                        final_state = SubtitleState.LOCKED
+                                        if tracker:
+                                            tracker.transition(segment_index, SubtitleState.LOCKED)
+                                        await websocket.send_json({
+                                            "type": "transcript",
+                                            "text": transcript,
+                                            "lang": whisper_language or "auto",
+                                            "subtitle_state": final_state.value,
+                                        })
 
-                                    # transcript message was already sent by process_and_stream
+                                    # Update SRT with final text + state
+                                    srt[-1].text = result.source
+                                    srt[-1].state = final_state
+
+                                    # Send translation if one was produced
                                     if result.translation:
                                         await websocket.send_json({"type": "translation", "text": result.translation})
 
-                                    # Background tasks: update context memory + vector store
+                                    # Background: context memory + vector store
                                     if ctx:
                                         asyncio.create_task(maybe_update_context(ctx))
-                                    segment_end_s = end_s
-                                    segment_start_s = last_transcript_end_s - (end_s - last_transcript_end_s) if last_transcript_end_s != end_s else 0.0
                                     asyncio.create_task(add_segment(
                                         session_id,
                                         result.source,
-                                        {"start_s": segment_start_s, "end_s": segment_end_s},
+                                        {"start_s": seg_start_s, "end_s": end_s,
+                                         "confidence": confidence, "state": final_state.value},
                                     ))
 
                                 except Exception:
@@ -337,4 +418,5 @@ async def ws_endpoint(websocket: WebSocket):
             pass
     finally:
         remove_store(session_id)
+        _revision_trackers.pop(session_id, None)
         logger.info("Client disconnected, session=%s", session_id)

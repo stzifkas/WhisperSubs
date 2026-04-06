@@ -36,13 +36,13 @@ let currentSessionId = null;
 
 // ── Caption display ───────────────────────────────────────────────────────────
 
-function addCaption(transcript, translation) {
+function addCaption(transcript, translation, subtitleState) {
   // Remove live caption block if present
   const live = captionsEl.querySelector('.caption-block.live');
   if (live) live.remove();
 
   const block = document.createElement('div');
-  block.className = 'caption-block';
+  block.className = 'caption-block' + (subtitleState ? ' subtitle-' + subtitleState : '');
 
   const tEl = document.createElement('p');
   tEl.className = 'transcript';
@@ -127,11 +127,11 @@ const TRANSLATION_WAIT_MS = 3000;
 // Accumulates streaming translation tokens before pendingBlock is committed.
 let streamingTranslation = '';
 
-function handleTranscript(text) {
+function handleTranscript(text, subtitleState) {
   liveText = '';  // Reset accumulation — completed transcript supersedes deltas
   streamingTranslation = '';
   flushPending();
-  pendingBlock = { transcript: text, translation: null };
+  pendingBlock = { transcript: text, translation: null, subtitleState: subtitleState || 'stable' };
   pendingTimer = setTimeout(flushPending, TRANSLATION_WAIT_MS);
 }
 
@@ -170,7 +170,7 @@ function handleTranslation(text) {
 function flushPending() {
   clearTimeout(pendingTimer);
   if (pendingBlock) {
-    addCaption(pendingBlock.transcript, pendingBlock.translation);
+    addCaption(pendingBlock.transcript, pendingBlock.translation, pendingBlock.subtitleState);
     updateSubPopup(pendingBlock.transcript, pendingBlock.translation);
     pendingBlock = null;
   }
@@ -210,7 +210,7 @@ function connectWS() {
         handleTranscriptDelta(msg.delta);
         break;
       case 'transcript':
-        handleTranscript(msg.text);
+        handleTranscript(msg.text, msg.subtitle_state);
         break;
       case 'translation_delta':
         handleTranslationDelta(msg.delta);

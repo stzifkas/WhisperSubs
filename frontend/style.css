@@ -310,6 +310,31 @@ body {
   color: #94a3b8;
 }
 
+/* Subtitle state indicators */
+.caption-block.subtitle-locked .transcript {
+  opacity: 0.75;
+}
+.caption-block.subtitle-locked::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #64748b;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+.caption-block.subtitle-stable::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
 .transcript {
   font-size: 26px;
   line-height: 1.5;
