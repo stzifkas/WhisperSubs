@@ -311,6 +311,40 @@ body {
 }
 
 /* Subtitle state indicators */
+
+/* tentative — raw transcript arrived, LLM still processing */
+.caption-block.subtitle-tentative .transcript {
+  color: #94a3b8;
+}
+.caption-block.subtitle-tentative::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #f59e0b;
+  margin-right: 8px;
+  vertical-align: middle;
+  animation: tentative-pulse 1.2s ease-in-out infinite;
+}
+@keyframes tentative-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+/* stable — refinement + translation committed */
+.caption-block.subtitle-stable::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+/* locked — outside revision window, text immutable */
 .caption-block.subtitle-locked .transcript {
   opacity: 0.75;
 }
@@ -321,16 +355,6 @@ body {
   height: 6px;
   border-radius: 50%;
   background: #64748b;
-  margin-right: 8px;
-  vertical-align: middle;
-}
-.caption-block.subtitle-stable::before {
-  content: '';
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #22c55e;
   margin-right: 8px;
   vertical-align: middle;
 }

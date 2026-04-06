@@ -128,62 +128,124 @@ function animateMicLevel() {
   animFrameId = requestAnimationFrame(animateMicLevel);
 }
 
-// ── Pending translation ───────────────────────────────────────────────────────
+// ── Subtitle lifecycle ────────────────────────────────────────────────────────
+// Each segment has an integer id (= backend segment_index).
+// State machine per block: tentative → (update) → stable | locked
+//
+// Events:  subtitle_tentative → subtitle_update → subtitle_commit
+//          subtitle_lock (may arrive for older blocks after new segments come in)
 
-let pendingBlock = null;
-let pendingTimer = null;
+// segment_id → DOM element for all committed+tentative blocks
+const subtitleBlocks = new Map();
+
+// Safety timeout — if subtitle_commit never arrives (e.g. LLM error), promote
+// the tentative block to stable after this delay so it doesn't hang forever.
 let TRANSLATION_WAIT_MS = MODE_COMMIT_DELAY_MS[modeSelect.value] ?? 2000;
+const COMMIT_SAFETY_BUFFER_MS = 4000;
 
-// Accumulates streaming translation tokens before pendingBlock is committed.
+// Accumulated streaming translation tokens for the current tentative block.
 let streamingTranslation = '';
 
-function handleTranscript(text, subtitleState) {
-  liveText = '';  // Reset accumulation — completed transcript supersedes deltas
+function _tentativeBlock() {
+  return captionsEl.querySelector('.caption-block.subtitle-tentative');
+}
+
+function handleSubtitleTentative(id, text, lang) {
+  // Dismiss live-delta block — the tentative block supersedes it.
+  liveText = '';
   streamingTranslation = '';
-  flushPending();
-  pendingBlock = { transcript: text, translation: null, subtitleState: subtitleState || 'stable' };
-  pendingTimer = setTimeout(flushPending, TRANSLATION_WAIT_MS);
+  const live = captionsEl.querySelector('.caption-block.live');
+  if (live) live.remove();
+
+  const block = document.createElement('div');
+  block.className = 'caption-block subtitle-tentative';
+  block.dataset.segmentId = id;
+
+  const tEl = document.createElement('p');
+  tEl.className = 'transcript';
+  tEl.textContent = text;
+  block.appendChild(tEl);
+
+  captionsEl.appendChild(block);
+
+  // Evict oldest blocks once we exceed the cap
+  while (captionsEl.children.length > maxCaptionBlocks) {
+    const first = captionsEl.firstChild;
+    const evictedId = first.dataset?.segmentId ? parseInt(first.dataset.segmentId) : null;
+    if (evictedId !== null) subtitleBlocks.delete(evictedId);
+    captionsEl.removeChild(first);
+  }
+
+  subtitleBlocks.set(id, block);
+  captionsWrap.scrollTop = captionsWrap.scrollHeight;
+
+  // Safety: if subtitle_commit never fires, promote to stable
+  block._commitTimer = setTimeout(() => {
+    if (block.classList.contains('subtitle-tentative')) {
+      block.classList.replace('subtitle-tentative', 'subtitle-stable');
+    }
+  }, TRANSLATION_WAIT_MS + COMMIT_SAFETY_BUFFER_MS);
+}
+
+function handleSubtitleUpdate(id, text) {
+  const block = subtitleBlocks.get(id);
+  if (!block) return;
+  const tEl = block.querySelector('.transcript');
+  if (tEl) tEl.textContent = text;
+  captionsWrap.scrollTop = captionsWrap.scrollHeight;
+  updateSubPopup(text, '');
 }
 
 function handleTranslationDelta(delta) {
   streamingTranslation += delta;
-  // Show live streaming translation inside the pending live block
-  let liveBlock = captionsEl.querySelector('.caption-block.live');
-  if (!liveBlock) {
-    // pendingBlock was set but no live block yet — create a temporary one
-    liveBlock = document.createElement('div');
-    liveBlock.className = 'caption-block live';
-    const p = document.createElement('p');
-    p.className = 'transcript';
-    p.textContent = pendingBlock ? pendingBlock.transcript : '';
-    liveBlock.appendChild(p);
-    captionsEl.appendChild(liveBlock);
-  }
-  let trEl = liveBlock.querySelector('.translation.streaming');
+  const block = _tentativeBlock();
+  if (!block) return;
+  let trEl = block.querySelector('.translation.streaming');
   if (!trEl) {
     trEl = document.createElement('p');
     trEl.className = 'translation streaming';
-    liveBlock.appendChild(trEl);
+    block.appendChild(trEl);
   }
   trEl.textContent = streamingTranslation;
   captionsWrap.scrollTop = captionsWrap.scrollHeight;
 }
 
-function handleTranslation(text) {
+function handleSubtitleCommit(id, text, translation, locked) {
   streamingTranslation = '';
-  if (pendingBlock) {
-    pendingBlock.translation = text;
-    flushPending();
+  const block = subtitleBlocks.get(id);
+  if (!block) {
+    // Revision-blocked path: no tentative block was created — render directly.
+    addCaption(text, translation || null, locked ? 'locked' : 'stable');
+    updateSubPopup(text, translation || '');
+    return;
   }
+
+  clearTimeout(block._commitTimer);
+
+  const tEl = block.querySelector('.transcript');
+  if (tEl) tEl.textContent = text;
+
+  // Replace streaming translation element with the final committed one.
+  const streamingTr = block.querySelector('.translation.streaming');
+  if (streamingTr) streamingTr.remove();
+  if (translation) {
+    const trEl = document.createElement('p');
+    trEl.className = 'translation';
+    trEl.textContent = translation;
+    block.appendChild(trEl);
+  }
+
+  block.className = 'caption-block ' + (locked ? 'subtitle-locked' : 'subtitle-stable');
+  updateSubPopup(text, translation || '');
+  captionsWrap.scrollTop = captionsWrap.scrollHeight;
 }
 
-function flushPending() {
-  clearTimeout(pendingTimer);
-  if (pendingBlock) {
-    addCaption(pendingBlock.transcript, pendingBlock.translation, pendingBlock.subtitleState);
-    updateSubPopup(pendingBlock.transcript, pendingBlock.translation);
-    pendingBlock = null;
-  }
+function handleSubtitleLock(id) {
+  const block = subtitleBlocks.get(id);
+  if (!block) return;
+  clearTimeout(block._commitTimer);
+  block.classList.remove('subtitle-tentative', 'subtitle-stable');
+  block.classList.add('subtitle-locked');
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -220,14 +282,20 @@ function connectWS() {
       case 'transcript_delta':
         handleTranscriptDelta(msg.delta);
         break;
-      case 'transcript':
-        handleTranscript(msg.text, msg.subtitle_state);
+      case 'subtitle_tentative':
+        handleSubtitleTentative(msg.id, msg.text, msg.lang);
+        break;
+      case 'subtitle_update':
+        handleSubtitleUpdate(msg.id, msg.text);
         break;
       case 'translation_delta':
         handleTranslationDelta(msg.delta);
         break;
-      case 'translation':
-        handleTranslation(msg.text);
+      case 'subtitle_commit':
+        handleSubtitleCommit(msg.id, msg.text, msg.translation, msg.locked);
+        break;
+      case 'subtitle_lock':
+        handleSubtitleLock(msg.id);
         break;
       case 'warning':
         showToast(msg.message, 'warn');
@@ -310,10 +378,16 @@ function stopRecording() {
   recording = false;
   cancelAnimationFrame(animFrameId);
 
-  // Clean up any live caption
-  const live = captionsEl.querySelector('.caption-block.live');
-  if (live) live.remove();
+  // Dismiss live-delta and any in-flight tentative blocks
+  captionsEl.querySelectorAll('.caption-block.live, .caption-block.subtitle-tentative')
+    .forEach(el => {
+      const sid = el.dataset?.segmentId ? parseInt(el.dataset.segmentId) : null;
+      if (sid !== null) subtitleBlocks.delete(sid);
+      clearTimeout(el._commitTimer);
+      el.remove();
+    });
   liveText = '';
+  streamingTranslation = '';
 
   if (audioContext) {
     audioContext.close();
@@ -525,6 +599,7 @@ langSelect.addEventListener('change', sendConfig);
 srcLangSelect.addEventListener('change', sendConfig);
 
 modeSelect.addEventListener('change', () => {
+  // Update safety-timer duration to match the new mode's expected commit latency.
   TRANSLATION_WAIT_MS = MODE_COMMIT_DELAY_MS[modeSelect.value] ?? 2000;
   sendMode();
 });
