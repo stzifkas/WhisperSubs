@@ -121,6 +121,12 @@ Browser
 
 ---
 
+## Contributing
+
+Contributions are welcome — bug reports, feature requests, and pull requests alike. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 Sokratis Tzifkas
