@@ -38,3 +38,7 @@ REVISION_MAX_AGE_S: float | None          = _REVISION_MAX_AGE_S  or None
 REVISION_MAX_SEGMENTS_BACK: int | None    = _REVISION_MAX_SEGS   or None
 MAX_QUEUE_DEPTH: int = int(os.getenv("MAX_QUEUE_DEPTH", "3"))
 WHISPER_RPM: int = int(os.getenv("WHISPER_RPM", "50"))
+
+# How long to retain a disconnected session's state (SRT, chat, context, vectors)
+# so downloads and post-stream chat keep working. After this, it is purged.
+SESSION_TTL_S: float = float(os.getenv("SESSION_TTL_S", "3600"))

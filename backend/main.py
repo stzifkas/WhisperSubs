@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import websockets
@@ -33,7 +34,23 @@ logger = logging.getLogger(__name__)
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
-app = FastAPI(title="WhisperSubs")
+SWEEP_INTERVAL_S = 60  # how often the sweeper checks for expired sessions
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    sweeper = asyncio.create_task(_session_sweeper())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        try:
+            await sweeper
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="WhisperSubs", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 _openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
@@ -76,6 +93,32 @@ class ChatSession:
 
 
 _chat_sessions: dict[str, ChatSession] = {}
+
+# Disconnected sessions are retained until this monotonic deadline, then purged.
+# Keeping them alive lets SRT download and chat keep working after a stream ends.
+_session_expiry: dict[str, float] = {}
+
+
+def _purge_session(session_id: str) -> None:
+    """Drop all state for one session in a single place."""
+    _srt_sessions.pop(session_id, None)
+    _chat_sessions.pop(session_id, None)
+    _session_contexts.pop(session_id, None)
+    _session_policies.pop(session_id, None)
+    _session_expiry.pop(session_id, None)
+    remove_store(session_id)
+
+
+async def _session_sweeper() -> None:
+    """Purge sessions whose retention window has elapsed."""
+    while True:
+        await asyncio.sleep(SWEEP_INTERVAL_S)
+        now = time.monotonic()
+        expired = [sid for sid, deadline in _session_expiry.items() if now >= deadline]
+        for sid in expired:
+            _purge_session(sid)
+            logger.info("Session %s expired and purged", sid)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -460,6 +503,10 @@ async def ws_endpoint(websocket: WebSocket):
         except Exception:
             pass
     finally:
-        remove_store(session_id)
-        _session_policies.pop(session_id, None)
-        logger.info("Client disconnected, session=%s", session_id)
+        # Retain session state for a while so SRT download and chat keep working;
+        # the sweeper purges it (vector store included) once the window elapses.
+        _session_expiry[session_id] = time.monotonic() + config.SESSION_TTL_S
+        logger.info(
+            "Client disconnected, session=%s (retained %ds)",
+            session_id, int(config.SESSION_TTL_S),
+        )
