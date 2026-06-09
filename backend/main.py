@@ -342,10 +342,20 @@ async def ws_endpoint(websocket: WebSocket):
                                     transcript[:60],
                                 )
 
-                                # ── Revision policy check ─────────────────────
+                                # ── Revision policy + auto-lock notifications ──
                                 policy = _session_policies.get(session_id)
                                 if policy:
-                                    policy.tracker.register(segment_index)
+                                    newly_locked = policy.tracker.register(segment_index)
+                                    # Notify frontend of any segments that were just
+                                    # locked out of the revision window.
+                                    for locked_idx in newly_locked:
+                                        try:
+                                            await websocket.send_json({
+                                                "type": "subtitle_lock",
+                                                "id": locked_idx,
+                                            })
+                                        except Exception:
+                                            break
                                     decision = policy.tracker.decide_revision(segment_index)
                                     log_decision(decision, policy.tracker.mode, session_id)
                                 else:
@@ -355,11 +365,19 @@ async def ws_endpoint(websocket: WebSocket):
                                     ctx = _session_contexts.get(session_id)
 
                                     if decision is None or decision.allowed:
-                                        # ── Revision allowed: refine + translate ──
+                                        # ── Revision allowed: show tentative, then refine + translate ──
+                                        await websocket.send_json({
+                                            "type": "subtitle_tentative",
+                                            "id": segment_index,
+                                            "text": transcript,
+                                            "lang": whisper_language or "auto",
+                                        })
+
                                         profile = policy.profile if policy else None
                                         result = await process_and_stream(
                                             transcript, target_language, whisper_language,
                                             ctx, websocket,
+                                            segment_id=segment_index,
                                             confidence=confidence,
                                             logprobs=event.get("logprobs"),
                                             refinement_low_threshold=(
@@ -378,26 +396,34 @@ async def ws_endpoint(websocket: WebSocket):
                                         final_state = SubtitleState.STABLE
                                         if policy:
                                             policy.tracker.transition(segment_index, SubtitleState.STABLE)
+
+                                        # Commit: finalizes text + translation in the frontend block.
+                                        await websocket.send_json({
+                                            "type": "subtitle_commit",
+                                            "id": segment_index,
+                                            "text": result.source,
+                                            "translation": result.translation or "",
+                                            "lang": whisper_language or "auto",
+                                        })
+
                                     else:
-                                        # ── Revision blocked: emit raw text as-is ──
+                                        # ── Revision blocked: commit immediately as locked ──
                                         result = ProcessResult(source=transcript)
                                         final_state = SubtitleState.LOCKED
                                         if policy:
                                             policy.tracker.transition(segment_index, SubtitleState.LOCKED)
                                         await websocket.send_json({
-                                            "type": "transcript",
+                                            "type": "subtitle_commit",
+                                            "id": segment_index,
                                             "text": transcript,
+                                            "translation": "",
                                             "lang": whisper_language or "auto",
-                                            "subtitle_state": final_state.value,
+                                            "locked": True,
                                         })
 
                                     # Update SRT with final text + state
                                     srt[-1].text = result.source
                                     srt[-1].state = final_state
-
-                                    # Send translation if one was produced
-                                    if result.translation:
-                                        await websocket.send_json({"type": "translation", "text": result.translation})
 
                                     # Background: context memory + vector store
                                     if ctx:

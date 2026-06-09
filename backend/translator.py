@@ -2,9 +2,13 @@
 
 Streams translation tokens through the WebSocket as they are generated,
 then returns the final ProcessResult for SRT storage.
+
+WebSocket events emitted by this module:
+  subtitle_update   {id, text, lang}   — refined source text (after refine_node)
+  translation_delta {delta}            — streaming translation token
 """
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from fastapi import WebSocket
 
@@ -36,39 +40,45 @@ async def process_and_stream(
     whisper_language: str,
     session_context: SessionContext,
     websocket: WebSocket,
+    segment_id: int = 0,
     confidence: float | None = None,
     logprobs: list[dict] | None = None,
     refinement_low_threshold: float = 0.55,
     refinement_high_risk_threshold: float = 0.80,
     correction_aggressiveness: str = "medium",
 ) -> ProcessResult:
-    """Run the refine → translate graph, streaming translation tokens to the WebSocket.
+    """Run the refine → translate → glossary_check graph, streaming to the WebSocket.
 
-    The `transcript` message is sent to the WebSocket as soon as the refine node
-    completes (before translation streaming begins), so the frontend can create its
-    pending caption block before translation deltas start arriving.
+    Emits:
+    - ``subtitle_update`` as soon as the refine node completes, so the frontend
+      can update the tentative caption block before translation tokens arrive.
+    - ``translation_delta`` for each streaming token from the translate node.
 
-    Returns ProcessResult with the final refined source and translation.
+    The caller (main.py) is responsible for sending ``subtitle_tentative`` before
+    calling this function and ``subtitle_commit`` after it returns.
+
+    Returns ProcessResult with the final refined source and (post-repair) translation.
     """
     if not raw.strip():
         return ProcessResult(source=raw)
 
     has_context = bool(session_context.get("summary") or session_context.get("glossary"))
 
-    # Nothing to do — skip the LLM entirely, but still send the transcript message
+    # Nothing to do — skip the LLM entirely; emit subtitle_update so the frontend
+    # can apply the raw text to the tentative block.
     if not target_language and not has_context:
         try:
             await websocket.send_json({
-                "type": "transcript",
+                "type": "subtitle_update",
+                "id": segment_id,
                 "text": raw,
                 "lang": whisper_language or "auto",
-                "subtitle_state": "stable",
             })
         except Exception:
             pass
         return ProcessResult(source=raw)
 
-    # Handle target language change - reset context memory
+    # Handle target language change — reset context memory
     prev_lang = session_context.get("target_language", "")
     if prev_lang and prev_lang != target_language:
         session_context["summary"] = ""
@@ -94,8 +104,8 @@ async def process_and_stream(
 
     refined_source = raw
     translation_parts: list[str] = []
-    transcript_sent = False
-    # Set when glossary_check_node completes; authoritative over translation_parts.
+    update_sent = False
+    # Authoritative translation from glossary_check_node (may be repaired).
     glossary_checked_translation: str | None = None
 
     async for event in translation_graph.astream_events(state, version="v2"):
@@ -103,26 +113,27 @@ async def process_and_stream(
         name = event.get("name", "")
         node = event.get("metadata", {}).get("langgraph_node", "")
 
-        # When the refine node finishes, send transcript immediately so the
-        # frontend creates pendingBlock before translation tokens start arriving.
+        # refine_node finished → send subtitle_update so the frontend can
+        # replace the tentative raw text with the refined source immediately,
+        # before translation streaming begins.
         if etype == "on_chain_end" and name == "refine":
             output = event.get("data", {}).get("output", {})
             if isinstance(output, dict):
                 refined_source = output.get("refined_source", raw) or raw
-            if not transcript_sent:
+            if not update_sent:
                 try:
                     await websocket.send_json({
-                        "type": "transcript",
+                        "type": "subtitle_update",
+                        "id": segment_id,
                         "text": refined_source,
                         "lang": whisper_language or "auto",
-                        "subtitle_state": "stable",
                     })
-                    transcript_sent = True
+                    update_sent = True
                 except Exception:
                     pass
 
-        # Stream translation tokens as they arrive from the translate node.
-        # Use metadata["langgraph_node"]. event["name"] is the LLM class name, not the node name.
+        # translate_node streaming — forward each token.
+        # Use metadata["langgraph_node"]; event["name"] is the LLM class name.
         elif etype == "on_chat_model_stream" and node == "translate":
             chunk = event.get("data", {}).get("chunk")
             if chunk and chunk.content:
@@ -135,29 +146,28 @@ async def process_and_stream(
                 except Exception:
                     pass
 
-        # glossary_check_node is authoritative: use its translation (may be
-        # repaired) instead of the raw streamed tokens.
+        # glossary_check_node finished — capture authoritative (possibly repaired) translation.
         elif etype == "on_chain_end" and name == "glossary_check":
             output = event.get("data", {}).get("output", {})
             if isinstance(output, dict):
                 glossary_checked_translation = output.get("translation", "")
 
-    # Prefer the post-repair translation from glossary_check_node; fall back
-    # to the raw accumulated tokens if the node didn't run (no target language).
+    # Prefer the post-repair translation; fall back to streamed tokens if the
+    # glossary_check node didn't run (i.e. no target language was set).
     translation = (
         glossary_checked_translation
         if glossary_checked_translation is not None
         else "".join(translation_parts).strip()
     )
 
-    # Fallback: if graph exited before refine_node's on_chain_end fired
-    if not transcript_sent:
+    # Fallback: if the graph exited before refine_node's on_chain_end fired.
+    if not update_sent:
         try:
             await websocket.send_json({
-                "type": "transcript",
+                "type": "subtitle_update",
+                "id": segment_id,
                 "text": refined_source,
                 "lang": whisper_language or "auto",
-                "subtitle_state": "stable",
             })
         except Exception:
             pass
