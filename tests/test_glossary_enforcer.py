@@ -362,3 +362,88 @@ async def test_same_term_consistently_detected_across_segments():
             assert len(violations) == 1, f"Expected violation for: {translation!r}"
         else:
             assert violations == [], f"Unexpected violation for: {translation!r}"
+
+
+# ── Word-boundary matching at the detect_violations level (from #20) ───────────
+
+def test_short_ascii_term_not_matched_inside_unrelated_word():
+    """A short ASCII term must not be flagged as present inside longer words.
+
+    Regression test for the unanchored substring search: "AI" used to match
+    "rain"/"again"/"maintain", producing a false present-check and a spurious
+    glossary violation.
+    """
+    glossary = {"AI": "인공지능"}
+    violations, hits, misses = detect_violations(
+        source="It will rain again, maintain calm.",
+        translation="비가 다시 올 것이다.",
+        glossary=glossary,
+    )
+    assert misses == 1          # term genuinely absent from the segment
+    assert hits == 0
+    assert violations == []     # no spurious violation / repair trigger
+
+
+def test_short_ascii_term_no_false_violation_inside_word():
+    """"US" must not match "house"/"must" and trigger a bogus violation."""
+    glossary = {"US": "미국"}
+    violations, hits, misses = detect_violations(
+        source="The house is a must.",
+        translation="그 집은 필수입니다.",
+        glossary=glossary,
+    )
+    assert misses == 1
+    assert violations == []
+
+
+def test_short_ascii_term_real_hit_still_detected():
+    """A standalone occurrence of a short ASCII term is still a real hit."""
+    glossary = {"AI": "AI"}
+    violations, hits, misses = detect_violations(
+        source="This product uses AI heavily.",
+        translation="이 제품은 AI를 많이 사용합니다.",
+        glossary=glossary,
+    )
+    assert hits == 1
+    assert violations == []
+
+
+def test_short_ascii_term_real_violation_still_detected():
+    """A standalone source term whose target is absent is still a violation."""
+    glossary = {"AI": "인공지능"}
+    violations, hits, misses = detect_violations(
+        source="We adopted AI last year.",
+        translation="우리는 작년에 그것을 도입했습니다.",  # target term absent
+        glossary=glossary,
+    )
+    assert len(violations) == 1
+    assert violations[0].source_term == "AI"
+
+
+def test_non_latin_term_still_matched_without_boundaries():
+    """Non-Latin terms keep substring matching (no word separators in CJK)."""
+    glossary = {"机器学习": "기계 학습"}
+    violations, hits, misses = detect_violations(
+        source="我们应用机器学习技术。",          # term embedded with no spaces
+        translation="기계 학습 기술을 적용합니다.",
+        glossary=glossary,
+    )
+    assert hits == 1
+    assert violations == []
+
+
+def test_mixed_script_term_matched_in_cjk_context():
+    """A term mixing Latin and CJK must match when embedded in CJK text.
+
+    The earlier Unicode-\\w boundary approach failed here because the
+    surrounding CJK characters are word-characters; routing on term.isascii()
+    sends mixed-script terms to substring matching instead.
+    """
+    glossary = {"GPT模型": "GPT 모델"}
+    violations, hits, misses = detect_violations(
+        source="我们用GPT模型来分析。",
+        translation="우리는 GPT 모델을 사용합니다.",
+        glossary=glossary,
+    )
+    assert hits == 1
+    assert violations == []
