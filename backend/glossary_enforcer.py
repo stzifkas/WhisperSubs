@@ -43,18 +43,18 @@ class GlossaryCheckResult:
 def _term_present(term: str, text: str) -> bool:
     """Return True if *term* occurs (case-insensitively) in *text*.
 
-    For ASCII-alphanumeric terms, uses word-boundary matching to avoid
-    false positives (e.g., "AI" matching "again"). For non-Latin or
-    non-alphanumeric terms, falls back to substring matching so that
-    CJK and other scripts still work correctly.
+    Pure-ASCII terms are anchored on alphanumeric boundaries so short terms
+    cannot produce spurious hits inside unrelated words (e.g. "AI" must not
+    match "again", "US" must not match "house").
+
+    Terms containing any non-ASCII character fall back to substring matching:
+    many scripts (CJK, etc.) lack word separators, and this also keeps
+    mixed-script terms (e.g. "GPT模型") matchable when embedded in such text.
     """
-    escaped = re.escape(term)
-    # If the term contains any ASCII word characters, anchor with word
-    # boundaries to prevent substring false positives.
-    if re.search(r"[A-Za-z0-9]", term):
-        pattern = rf"(?<!\w){escaped}(?!\w)"
+    if term.isascii():
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
     else:
-        pattern = escaped
+        pattern = re.escape(term)
     return bool(re.search(pattern, text, re.IGNORECASE))
 
 
