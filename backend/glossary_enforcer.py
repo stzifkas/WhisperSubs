@@ -43,10 +43,19 @@ class GlossaryCheckResult:
 def _term_present(term: str, text: str) -> bool:
     """Return True if *term* occurs (case-insensitively) in *text*.
 
-    Uses a simple regex search without strict word-boundary anchors so that
-    the check works correctly for non-Latin scripts and compound words.
+    For ASCII-alphanumeric terms, uses word-boundary matching to avoid
+    false positives (e.g., "AI" matching "again"). For non-Latin or
+    non-alphanumeric terms, falls back to substring matching so that
+    CJK and other scripts still work correctly.
     """
-    return bool(re.search(re.escape(term), text, re.IGNORECASE))
+    escaped = re.escape(term)
+    # If the term contains any ASCII word characters, anchor with word
+    # boundaries to prevent substring false positives.
+    if re.search(r"[A-Za-z0-9]", term):
+        pattern = rf"(?<!\w){escaped}(?!\w)"
+    else:
+        pattern = escaped
+    return bool(re.search(pattern, text, re.IGNORECASE))
 
 
 def detect_violations(
