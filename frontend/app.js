@@ -406,7 +406,6 @@ function stopRecording() {
   startBtn.classList.remove('recording');
   audioSourceSelect.disabled = false;
   setStatus('Idle');
-  flushPending();
 }
 
 // ── Subtitle popup ────────────────────────────────────────────────────────────
