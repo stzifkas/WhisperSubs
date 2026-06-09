@@ -34,6 +34,22 @@ Or with Docker:
 docker compose up --build
 ```
 
+### Running tests
+
+```bash
+pytest
+```
+
+The suite is fast and runs without network access or an API key (model calls are mocked). Keep it green, and add tests for any behaviour change.
+
+---
+
+## Claiming an issue
+
+Before writing code, **comment on the issue to claim it** (e.g. "Taking this one"). This prevents two people from building the same fix, and it's also how a maintainer can add you as the assignee — GitHub only lets us assign people who have commented or are collaborators.
+
+First check the issue isn't already claimed or linked to an open PR. Please work one issue at a time; it keeps things fair for other contributors.
+
 ---
 
 ## Submitting a pull request
@@ -43,13 +59,17 @@ docker compose up --build
    git checkout -b fix/my-bug-fix
    ```
 
-2. Make your changes. Keep commits focused — one logical change per commit.
+2. Make your changes. Keep commits focused — one logical change per commit, and **one issue per pull request**.
 
-3. Test manually: start the server, capture some audio, verify captions and translation work end-to-end.
+3. Run the test suite and add tests for any behaviour change:
+   ```bash
+   pytest
+   ```
+   Also verify manually where it helps: start the server, capture some audio, and confirm captions and translation work end-to-end.
 
-4. Open a PR against `main`. Include:
+4. Open a PR against `main`. Link the issue with `Closes #123` in the description, and include:
    - What the change does and why
-   - How you tested it
+   - How you tested it (and that `pytest` passes)
    - Screenshots or log excerpts if relevant
 
 ---
