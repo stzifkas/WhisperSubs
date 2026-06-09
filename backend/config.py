@@ -5,8 +5,6 @@ load_dotenv()
 
 OPENAI_API_KEY: str = os.environ["OPENAI_API_KEY"]
 TARGET_LANGUAGE: str = os.getenv("TARGET_LANGUAGE", "")
-CHUNK_DURATION_S: int = int(os.getenv("CHUNK_DURATION_S", "5"))
-CHUNK_OVERLAP_S: int = int(os.getenv("CHUNK_OVERLAP_S", "1"))
 REALTIME_MODEL: str = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "gpt-4o-transcribe")
 WHISPER_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "")  # e.g. "en", "el" — leave empty for auto-detect
@@ -36,8 +34,6 @@ _REVISION_MAX_AGE_S  = float(os.getenv("REVISION_MAX_AGE_S", "0"))
 _REVISION_MAX_SEGS   = int(os.getenv("REVISION_MAX_SEGMENTS_BACK", "0"))
 REVISION_MAX_AGE_S: float | None          = _REVISION_MAX_AGE_S  or None
 REVISION_MAX_SEGMENTS_BACK: int | None    = _REVISION_MAX_SEGS   or None
-MAX_QUEUE_DEPTH: int = int(os.getenv("MAX_QUEUE_DEPTH", "3"))
-WHISPER_RPM: int = int(os.getenv("WHISPER_RPM", "50"))
 
 # How long to retain a disconnected session's state (SRT, chat, context, vectors)
 # so downloads and post-stream chat keep working. After this, it is purged.
