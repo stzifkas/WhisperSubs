@@ -36,6 +36,19 @@ FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
 SWEEP_INTERVAL_S = 60  # how often the sweeper checks for expired sessions
 
+# Fire-and-forget background tasks. asyncio keeps only a weak reference to a
+# task, so a bare `create_task(...)` whose result is discarded can be garbage
+# collected mid-execution. Retain strong references here until they finish.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """Schedule a background task and keep a strong reference until it finishes."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -207,7 +220,7 @@ async def chat_endpoint(session_id: str, req: ChatRequest):
     if srt is None or chat is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    asyncio.create_task(_maybe_summarize(session_id))
+    _spawn(_maybe_summarize(session_id))
 
     relevant = await search_segments(session_id, req.message, k=6)
     recent_text = "\n".join(relevant) or "(no transcript yet)"
@@ -470,8 +483,8 @@ async def ws_endpoint(websocket: WebSocket):
 
                                     # Background: context memory + vector store
                                     if ctx:
-                                        asyncio.create_task(maybe_update_context(ctx))
-                                    asyncio.create_task(add_segment(
+                                        _spawn(maybe_update_context(ctx))
+                                    _spawn(add_segment(
                                         session_id,
                                         result.source,
                                         {"start_s": seg_start_s, "end_s": end_s,
