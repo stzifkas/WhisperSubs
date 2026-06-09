@@ -263,7 +263,7 @@ async def ws_endpoint(websocket: WebSocket):
     target_language = config.TARGET_LANGUAGE
     whisper_language = config.WHISPER_LANGUAGE
     vad_threshold = config.NO_SPEECH_THRESHOLD        # 0–1, higher = stricter
-    silence_duration_ms = int(config.SILENCE_RMS_THRESHOLD)  # ms of silence before turn ends
+    silence_duration_ms = config.VAD_SILENCE_DURATION_MS  # ms of silence before turn ends
     session_start = time.monotonic()
     last_transcript_end_s = 0.0
 
