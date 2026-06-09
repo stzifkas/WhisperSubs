@@ -163,6 +163,31 @@ def test_multiword_source_term_hit():
     assert violations == []
 
 
+def test_short_ascii_term_no_false_positive_substring():
+    """Short ASCII terms like 'AI' should NOT match substrings like 'again'."""
+    from backend.glossary_enforcer import _term_present
+    assert _term_present("AI", "again") is False
+    assert _term_present("AI", "rain") is False
+    assert _term_present("AI", "maintain") is False
+    assert _term_present("US", "house") is False
+    assert _term_present("US", "must") is False
+
+
+def test_short_ascii_term_matches_whole_word():
+    """Short ASCII terms should match as whole words."""
+    from backend.glossary_enforcer import _term_present
+    assert _term_present("AI", "Use AI for this.") is True
+    assert _term_present("AI", "The AI model works.") is True
+    assert _term_present("US", "US region selected.") is True
+
+
+def test_non_latin_term_still_matches_substring():
+    """Non-Latin terms should still match via substring (no word boundaries)."""
+    from backend.glossary_enforcer import _term_present
+    assert _term_present("인공지능", "인공지능 모델") is True
+    assert _term_present("机器学习", "我们应用机器学习技术") is True
+
+
 def test_log_metrics_hit_emits_info(caplog):
     with caplog.at_level(logging.INFO, logger="backend.glossary_enforcer"):
         log_metrics(violations=[], hits=3, misses=1, repaired=False, session_id="abc123")
