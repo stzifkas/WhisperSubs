@@ -378,9 +378,6 @@ async def ws_endpoint(websocket: WebSocket):
                 }))
             except websockets.exceptions.ConnectionClosed:
                 return  # upstream gone; the supervisor will reconnect
-            except Exception as exc:
-                logger.warning("audio_sender error: %s", exc)
-                return
 
     async def openai_listener(openai_ws):
         nonlocal last_transcript_end_s
@@ -557,7 +554,14 @@ async def ws_endpoint(websocket: WebSocket):
                         conn["ws"] = None
                         for task in (sender_task, listener_task):
                             task.cancel()
-                        await asyncio.gather(sender_task, listener_task, return_exceptions=True)
+                        results = await asyncio.gather(
+                            sender_task, listener_task, return_exceptions=True,
+                        )
+                        # Surface (don't swallow) unexpected task failures;
+                        # CancelledError is a BaseException, so it's excluded.
+                        for result in results:
+                            if isinstance(result, Exception):
+                                logger.warning("Realtime task failed: %s", result)
             except Exception as exc:
                 logger.warning("Realtime connection error: %s", exc)
 
