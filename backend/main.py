@@ -5,7 +5,7 @@ import logging
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import websockets
@@ -39,7 +39,6 @@ RECONNECT_INITIAL_BACKOFF_S = 0.5
 RECONNECT_MAX_BACKOFF_S = 8.0
 RECONNECT_MAX_RETRIES = 6
 AUDIO_QUEUE_MAXSIZE = 256
-_RECONFIGURE = object()  # queue sentinel: re-apply session config upstream
 
 # Fire-and-forget background tasks. asyncio keeps only a weak reference to a
 # task, so a bare `create_task(...)` whose result is discarded can be garbage
@@ -287,6 +286,7 @@ async def ws_endpoint(websocket: WebSocket):
 
     realtime_url = f"wss://api.openai.com/v1/realtime?model={config.REALTIME_MODEL}"
     audio_queue: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
+    conn: dict = {"ws": None}  # current upstream connection, owned by the supervisor
 
     async def send_session_update(openai_ws):
         cfg: dict = {
@@ -338,10 +338,14 @@ async def ws_endpoint(websocket: WebSocket):
                             vad_threshold = float(data["no_speech_threshold"])
                         if "silence_threshold" in data:
                             silence_duration_ms = int(float(data["silence_threshold"]))
-                        try:
-                            audio_queue.put_nowait(_RECONFIGURE)
-                        except asyncio.QueueFull:
-                            pass
+                        # Apply immediately upstream if connected; otherwise the
+                        # supervisor re-applies current config on the next connect.
+                        openai_ws = conn["ws"]
+                        if openai_ws is not None:
+                            try:
+                                await send_session_update(openai_ws)
+                            except websockets.exceptions.ConnectionClosed:
+                                pass
                         logger.info(
                             "Config: lang=%r src=%r vad=%.2f silence_ms=%d",
                             target_language, whisper_language, vad_threshold, silence_duration_ms,
@@ -363,20 +367,20 @@ async def ws_endpoint(websocket: WebSocket):
             pass
 
     async def audio_sender(openai_ws):
-        """Drain queued audio (and config-reapply requests) to the upstream."""
+        """Drain queued audio frames to the upstream."""
         while True:
-            item = await audio_queue.get()
+            frame = await audio_queue.get()
             try:
-                if item is _RECONFIGURE:
-                    await send_session_update(openai_ws)
-                else:
-                    audio_b64 = base64.b64encode(item).decode()
-                    await openai_ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": audio_b64,
-                    }))
+                audio_b64 = base64.b64encode(frame).decode()
+                await openai_ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": audio_b64,
+                }))
             except websockets.exceptions.ConnectionClosed:
                 return  # upstream gone; the supervisor will reconnect
+            except Exception as exc:
+                logger.warning("audio_sender error: %s", exc)
+                return
 
     async def openai_listener(openai_ws):
         nonlocal last_transcript_end_s
@@ -533,18 +537,27 @@ async def ws_endpoint(websocket: WebSocket):
                         "OpenAI-Beta": "realtime=v1",
                     },
                 ) as openai_ws:
+                    conn["ws"] = openai_ws
                     await send_session_update(openai_ws)
                     if attempts:
                         await notify_client({"type": "status", "status": "connected"})
                     backoff = RECONNECT_INITIAL_BACKOFF_S
                     attempts = 0
                     sender_task = asyncio.create_task(audio_sender(openai_ws))
+                    listener_task = asyncio.create_task(openai_listener(openai_ws))
                     try:
-                        await openai_listener(openai_ws)
+                        # Reconnect when EITHER side ends — an upstream drop, the
+                        # listener exiting, or a sender failure — so a dead sender
+                        # can't leave us blocked while audio stops flowing.
+                        await asyncio.wait(
+                            {sender_task, listener_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
                     finally:
-                        sender_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await sender_task
+                        conn["ws"] = None
+                        for task in (sender_task, listener_task):
+                            task.cancel()
+                        await asyncio.gather(sender_task, listener_task, return_exceptions=True)
             except Exception as exc:
                 logger.warning("Realtime connection error: %s", exc)
 
