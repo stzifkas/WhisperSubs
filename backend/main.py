@@ -34,6 +34,12 @@ FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
 SWEEP_INTERVAL_S = 60  # how often the sweeper checks for expired sessions
 
+# Realtime upstream reconnection (backend ↔ OpenAI)
+RECONNECT_INITIAL_BACKOFF_S = 0.5
+RECONNECT_MAX_BACKOFF_S = 8.0
+RECONNECT_MAX_RETRIES = 6
+AUDIO_QUEUE_MAXSIZE = 256
+
 # Fire-and-forget background tasks. asyncio keeps only a weak reference to a
 # task, so a bare `create_task(...)` whose result is discarded can be garbage
 # collected mid-execution. Retain strong references here until they finish.
@@ -279,240 +285,316 @@ async def ws_endpoint(websocket: WebSocket):
     last_transcript_end_s = 0.0
 
     realtime_url = f"wss://api.openai.com/v1/realtime?model={config.REALTIME_MODEL}"
+    audio_queue: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
+    conn: dict = {"ws": None}  # current upstream connection, owned by the supervisor
+
+    async def send_session_update(openai_ws):
+        cfg: dict = {
+            "input_audio_format": "pcm16",
+            "input_audio_transcription": {"model": config.WHISPER_MODEL},
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": vad_threshold,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": max(200, silence_duration_ms),
+            },
+            "include": ["item.input_audio_transcription.logprobs"],
+        }
+        if whisper_language:
+            cfg["input_audio_transcription"]["language"] = whisper_language
+        await openai_ws.send(json.dumps({"type": "session.update", "session": cfg}))
+
+    async def notify_client(payload: dict) -> bool:
+        """Send a status/error message to the browser; False if it has gone away."""
+        try:
+            await websocket.send_json(payload)
+            return True
+        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed, RuntimeError):
+            return False
+
+    async def client_receiver():
+        """Read from the browser: queue audio, apply config/mode changes."""
+        nonlocal target_language, whisper_language, vad_threshold, silence_duration_ms
+        try:
+            while True:
+                message = await websocket.receive()
+
+                if "bytes" in message and message["bytes"]:
+                    try:
+                        audio_queue.put_nowait(message["bytes"])
+                    except asyncio.QueueFull:
+                        pass  # drop frames while the upstream is backed up / reconnecting
+
+                elif "text" in message and message["text"]:
+                    try:
+                        data = json.loads(message["text"])
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("type") == "config":
+                        target_language = data.get("target_language", target_language)
+                        if "whisper_language" in data:
+                            whisper_language = data["whisper_language"]
+                        if "no_speech_threshold" in data:
+                            vad_threshold = float(data["no_speech_threshold"])
+                        if "silence_threshold" in data:
+                            silence_duration_ms = int(float(data["silence_threshold"]))
+                        # Apply immediately upstream if connected; otherwise the
+                        # supervisor re-applies current config on the next connect.
+                        openai_ws = conn["ws"]
+                        if openai_ws is not None:
+                            try:
+                                await send_session_update(openai_ws)
+                            except websockets.exceptions.ConnectionClosed:
+                                pass
+                        logger.info(
+                            "Config: lang=%r src=%r vad=%.2f silence_ms=%d",
+                            target_language, whisper_language, vad_threshold, silence_duration_ms,
+                        )
+                    elif data.get("type") == "mode":
+                        raw_mode = data.get("mode", "")
+                        try:
+                            new_mode = InterpreterMode(raw_mode)
+                            policy = _session_policies.get(session_id)
+                            if policy:
+                                policy.switch_to(new_mode)
+                                logger.info(
+                                    "Mode switched to %r for session=%s",
+                                    new_mode.value, session_id,
+                                )
+                        except ValueError:
+                            logger.warning("Unknown interpreter mode: %r", raw_mode)
+        except WebSocketDisconnect:
+            pass
+
+    async def audio_sender(openai_ws):
+        """Drain queued audio frames to the upstream."""
+        while True:
+            frame = await audio_queue.get()
+            try:
+                audio_b64 = base64.b64encode(frame).decode()
+                await openai_ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": audio_b64,
+                }))
+            except websockets.exceptions.ConnectionClosed:
+                return  # upstream gone; the supervisor will reconnect
+
+    async def openai_listener(openai_ws):
+        nonlocal last_transcript_end_s
+        try:
+            async for raw in openai_ws:
+                event = json.loads(raw)
+                etype = event.get("type", "")
+
+                if etype == "conversation.item.input_audio_transcription.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        try:
+                            await websocket.send_json({"type": "transcript_delta", "delta": delta})
+                        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+                            break
+
+                elif etype == "conversation.item.input_audio_transcription.completed":
+                    transcript = event.get("transcript", "").strip()
+                    if transcript and not _is_garbage(transcript):
+                        confidence = parse_confidence(event.get("logprobs"))
+                        end_s = time.monotonic() - session_start
+                        seg_start_s = last_transcript_end_s
+                        srt = _srt_sessions[session_id]
+                        srt.append(SRTSegment(seg_start_s, end_s, transcript, confidence))
+                        segment_index = len(srt) - 1
+                        last_transcript_end_s = end_s
+                        logger.info(
+                            "Transcript seg=%d confidence=%.3f (%s): %r",
+                            segment_index,
+                            confidence if confidence is not None else float("nan"),
+                            confidence_level(confidence),
+                            transcript[:60],
+                        )
+
+                        # ── Revision policy + auto-lock notifications ──
+                        policy = _session_policies.get(session_id)
+                        if policy:
+                            newly_locked = policy.tracker.register(segment_index)
+                            # Notify frontend of any segments that were just
+                            # locked out of the revision window.
+                            for locked_idx in newly_locked:
+                                try:
+                                    await websocket.send_json({
+                                        "type": "subtitle_lock",
+                                        "id": locked_idx,
+                                    })
+                                except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+                                    break
+                            decision = policy.tracker.decide_revision(segment_index)
+                            log_decision(decision, policy.tracker.mode, session_id)
+                        else:
+                            decision = None
+
+                        try:
+                            ctx = _session_contexts.get(session_id)
+
+                            if decision is None or decision.allowed:
+                                # ── Revision allowed: show tentative, then refine + translate ──
+                                await websocket.send_json({
+                                    "type": "subtitle_tentative",
+                                    "id": segment_index,
+                                    "text": transcript,
+                                    "lang": whisper_language or "auto",
+                                })
+
+                                profile = policy.profile if policy else None
+                                result = await process_and_stream(
+                                    transcript, target_language, whisper_language,
+                                    ctx, websocket,
+                                    segment_id=segment_index,
+                                    confidence=confidence,
+                                    logprobs=event.get("logprobs"),
+                                    refinement_low_threshold=(
+                                        profile.refinement_low_threshold if profile
+                                        else config.REFINEMENT_LOW_CONFIDENCE_THRESHOLD
+                                    ),
+                                    refinement_high_risk_threshold=(
+                                        profile.refinement_high_risk_threshold if profile
+                                        else config.REFINEMENT_HIGH_RISK_THRESHOLD
+                                    ),
+                                    correction_aggressiveness=(
+                                        profile.correction_aggressiveness if profile
+                                        else "medium"
+                                    ),
+                                )
+                                final_state = SubtitleState.STABLE
+                                if policy:
+                                    policy.tracker.transition(segment_index, SubtitleState.STABLE)
+
+                                # Commit: finalizes text + translation in the frontend block.
+                                await websocket.send_json({
+                                    "type": "subtitle_commit",
+                                    "id": segment_index,
+                                    "text": result.source,
+                                    "translation": result.translation or "",
+                                    "lang": whisper_language or "auto",
+                                })
+
+                            else:
+                                # ── Revision blocked: commit immediately as locked ──
+                                result = ProcessResult(source=transcript)
+                                final_state = SubtitleState.LOCKED
+                                if policy:
+                                    policy.tracker.transition(segment_index, SubtitleState.LOCKED)
+                                await websocket.send_json({
+                                    "type": "subtitle_commit",
+                                    "id": segment_index,
+                                    "text": transcript,
+                                    "translation": "",
+                                    "lang": whisper_language or "auto",
+                                    "locked": True,
+                                })
+
+                            # Update SRT with final text + state
+                            srt[-1].text = result.source
+                            srt[-1].state = final_state
+
+                            # Background: context memory + vector store
+                            if ctx:
+                                _spawn(maybe_update_context(ctx))
+                            _spawn(add_segment(
+                                session_id,
+                                result.source,
+                                {"start_s": seg_start_s, "end_s": end_s,
+                                 "confidence": confidence, "state": final_state.value},
+                            ))
+
+                        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+                            break
+
+                elif etype == "error":
+                    err = event.get("error", {}).get("message", "OpenAI Realtime error")
+                    logger.error("OpenAI Realtime error: %s", event)
+                    try:
+                        await websocket.send_json({"type": "error", "message": err})
+                    except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+                        pass
+
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:
+            logger.error("OpenAI listener error: %s", e)
+
+    async def openai_supervisor():
+        """Own the upstream connection; reconnect with backoff on transient drops."""
+        backoff = RECONNECT_INITIAL_BACKOFF_S
+        attempts = 0
+        while True:
+            try:
+                async with websockets.connect(
+                    realtime_url,
+                    additional_headers={
+                        "Authorization": f"Bearer {config.OPENAI_API_KEY}",
+                        "OpenAI-Beta": "realtime=v1",
+                    },
+                ) as openai_ws:
+                    conn["ws"] = openai_ws
+                    await send_session_update(openai_ws)
+                    if attempts:
+                        await notify_client({"type": "status", "status": "connected"})
+                    backoff = RECONNECT_INITIAL_BACKOFF_S
+                    attempts = 0
+                    sender_task = asyncio.create_task(audio_sender(openai_ws))
+                    listener_task = asyncio.create_task(openai_listener(openai_ws))
+                    try:
+                        # Reconnect when EITHER side ends — an upstream drop, the
+                        # listener exiting, or a sender failure — so a dead sender
+                        # can't leave us blocked while audio stops flowing.
+                        await asyncio.wait(
+                            {sender_task, listener_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        conn["ws"] = None
+                        for task in (sender_task, listener_task):
+                            task.cancel()
+                        results = await asyncio.gather(
+                            sender_task, listener_task, return_exceptions=True,
+                        )
+                        # Surface (don't swallow) unexpected task failures;
+                        # CancelledError is a BaseException, so it's excluded.
+                        for result in results:
+                            if isinstance(result, Exception):
+                                logger.warning("Realtime task failed: %s", result)
+            except Exception as exc:
+                logger.warning("Realtime connection error: %s", exc)
+
+            # Reached on any upstream drop or failed connect attempt.
+            attempts += 1
+            if attempts > RECONNECT_MAX_RETRIES:
+                await notify_client({
+                    "type": "error",
+                    "message": "Lost connection to the transcription service.",
+                })
+                return
+            if not await notify_client({"type": "status", "status": "reconnecting"}):
+                return  # browser is gone — nothing to reconnect for
+            await asyncio.sleep(backoff)
+            backoff = min(RECONNECT_MAX_BACKOFF_S, backoff * 2)
 
     try:
-        async with websockets.connect(
-            realtime_url,
-            additional_headers={
-                "Authorization": f"Bearer {config.OPENAI_API_KEY}",
-                "OpenAI-Beta": "realtime=v1",
-            },
-        ) as openai_ws:
-
-            async def send_session_update():
-                cfg: dict = {
-                    "input_audio_format": "pcm16",
-                    "input_audio_transcription": {"model": config.WHISPER_MODEL},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": vad_threshold,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": max(200, silence_duration_ms),
-                    },
-                    "include": ["item.input_audio_transcription.logprobs"],
-                }
-                if whisper_language:
-                    cfg["input_audio_transcription"]["language"] = whisper_language
-                await openai_ws.send(json.dumps({"type": "session.update", "session": cfg}))
-
-            await send_session_update()
-
-            async def receiver():
-                nonlocal target_language, whisper_language, vad_threshold, silence_duration_ms
-                try:
-                    while True:
-                        message = await websocket.receive()
-
-                        if "bytes" in message and message["bytes"]:
-                            audio_b64 = base64.b64encode(message["bytes"]).decode()
-                            try:
-                                await openai_ws.send(json.dumps({
-                                    "type": "input_audio_buffer.append",
-                                    "audio": audio_b64,
-                                }))
-                            except websockets.exceptions.ConnectionClosed:
-                                break
-
-                        elif "text" in message and message["text"]:
-                            try:
-                                data = json.loads(message["text"])
-                                if data.get("type") == "config":
-                                    target_language = data.get("target_language", target_language)
-                                    if "whisper_language" in data:
-                                        whisper_language = data["whisper_language"]
-                                    if "no_speech_threshold" in data:
-                                        vad_threshold = float(data["no_speech_threshold"])
-                                    if "silence_threshold" in data:
-                                        silence_duration_ms = int(float(data["silence_threshold"]))
-                                    try:
-                                        await send_session_update()
-                                    except websockets.exceptions.ConnectionClosed:
-                                        break
-                                    logger.info(
-                                        "Config: lang=%r src=%r vad=%.2f silence_ms=%d",
-                                        target_language, whisper_language, vad_threshold, silence_duration_ms,
-                                    )
-                                elif data.get("type") == "mode":
-                                    raw_mode = data.get("mode", "")
-                                    try:
-                                        new_mode = InterpreterMode(raw_mode)
-                                        policy = _session_policies.get(session_id)
-                                        if policy:
-                                            policy.switch_to(new_mode)
-                                            logger.info(
-                                                "Mode switched to %r for session=%s",
-                                                new_mode.value, session_id,
-                                            )
-                                    except ValueError:
-                                        logger.warning("Unknown interpreter mode: %r", raw_mode)
-                            except json.JSONDecodeError:
-                                pass
-
-                except WebSocketDisconnect:
-                    pass
-                finally:
-                    await openai_ws.close()
-
-            async def openai_listener():
-                nonlocal last_transcript_end_s
-                try:
-                    async for raw in openai_ws:
-                        event = json.loads(raw)
-                        etype = event.get("type", "")
-
-                        if etype == "conversation.item.input_audio_transcription.delta":
-                            delta = event.get("delta", "")
-                            if delta:
-                                try:
-                                    await websocket.send_json({"type": "transcript_delta", "delta": delta})
-                                except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
-                                    break
-
-                        elif etype == "conversation.item.input_audio_transcription.completed":
-                            transcript = event.get("transcript", "").strip()
-                            if transcript and not _is_garbage(transcript):
-                                confidence = parse_confidence(event.get("logprobs"))
-                                end_s = time.monotonic() - session_start
-                                seg_start_s = last_transcript_end_s
-                                srt = _srt_sessions[session_id]
-                                srt.append(SRTSegment(seg_start_s, end_s, transcript, confidence))
-                                segment_index = len(srt) - 1
-                                last_transcript_end_s = end_s
-                                logger.info(
-                                    "Transcript seg=%d confidence=%.3f (%s): %r",
-                                    segment_index,
-                                    confidence if confidence is not None else float("nan"),
-                                    confidence_level(confidence),
-                                    transcript[:60],
-                                )
-
-                                # ── Revision policy + auto-lock notifications ──
-                                policy = _session_policies.get(session_id)
-                                if policy:
-                                    newly_locked = policy.tracker.register(segment_index)
-                                    # Notify frontend of any segments that were just
-                                    # locked out of the revision window.
-                                    for locked_idx in newly_locked:
-                                        try:
-                                            await websocket.send_json({
-                                                "type": "subtitle_lock",
-                                                "id": locked_idx,
-                                            })
-                                        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
-                                            break
-                                    decision = policy.tracker.decide_revision(segment_index)
-                                    log_decision(decision, policy.tracker.mode, session_id)
-                                else:
-                                    decision = None
-
-                                try:
-                                    ctx = _session_contexts.get(session_id)
-
-                                    if decision is None or decision.allowed:
-                                        # ── Revision allowed: show tentative, then refine + translate ──
-                                        await websocket.send_json({
-                                            "type": "subtitle_tentative",
-                                            "id": segment_index,
-                                            "text": transcript,
-                                            "lang": whisper_language or "auto",
-                                        })
-
-                                        profile = policy.profile if policy else None
-                                        result = await process_and_stream(
-                                            transcript, target_language, whisper_language,
-                                            ctx, websocket,
-                                            segment_id=segment_index,
-                                            confidence=confidence,
-                                            logprobs=event.get("logprobs"),
-                                            refinement_low_threshold=(
-                                                profile.refinement_low_threshold if profile
-                                                else config.REFINEMENT_LOW_CONFIDENCE_THRESHOLD
-                                            ),
-                                            refinement_high_risk_threshold=(
-                                                profile.refinement_high_risk_threshold if profile
-                                                else config.REFINEMENT_HIGH_RISK_THRESHOLD
-                                            ),
-                                            correction_aggressiveness=(
-                                                profile.correction_aggressiveness if profile
-                                                else "medium"
-                                            ),
-                                        )
-                                        final_state = SubtitleState.STABLE
-                                        if policy:
-                                            policy.tracker.transition(segment_index, SubtitleState.STABLE)
-
-                                        # Commit: finalizes text + translation in the frontend block.
-                                        await websocket.send_json({
-                                            "type": "subtitle_commit",
-                                            "id": segment_index,
-                                            "text": result.source,
-                                            "translation": result.translation or "",
-                                            "lang": whisper_language or "auto",
-                                        })
-
-                                    else:
-                                        # ── Revision blocked: commit immediately as locked ──
-                                        result = ProcessResult(source=transcript)
-                                        final_state = SubtitleState.LOCKED
-                                        if policy:
-                                            policy.tracker.transition(segment_index, SubtitleState.LOCKED)
-                                        await websocket.send_json({
-                                            "type": "subtitle_commit",
-                                            "id": segment_index,
-                                            "text": transcript,
-                                            "translation": "",
-                                            "lang": whisper_language or "auto",
-                                            "locked": True,
-                                        })
-
-                                    # Update SRT with final text + state
-                                    srt[-1].text = result.source
-                                    srt[-1].state = final_state
-
-                                    # Background: context memory + vector store
-                                    if ctx:
-                                        _spawn(maybe_update_context(ctx))
-                                    _spawn(add_segment(
-                                        session_id,
-                                        result.source,
-                                        {"start_s": seg_start_s, "end_s": end_s,
-                                         "confidence": confidence, "state": final_state.value},
-                                    ))
-
-                                except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
-                                    break
-
-                        elif etype == "error":
-                            err = event.get("error", {}).get("message", "OpenAI Realtime error")
-                            logger.error("OpenAI Realtime error: %s", event)
-                            try:
-                                await websocket.send_json({"type": "error", "message": err})
-                            except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
-                                pass
-
-                except websockets.exceptions.ConnectionClosed:
-                    pass
-                except Exception as e:
-                    logger.error("OpenAI listener error: %s", e)
-
-            await asyncio.gather(receiver(), openai_listener())
-
+        client_task = asyncio.create_task(client_receiver())
+        supervisor_task = asyncio.create_task(openai_supervisor())
+        done, pending = await asyncio.wait(
+            {client_task, supervisor_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                logger.error("Session task error: %s", exc)
     except Exception as exc:
         logger.error("Session error: %s", exc)
-        try:
-            await websocket.send_json({"type": "error", "message": str(exc)})
-        except Exception:
-            pass
+        await notify_client({"type": "error", "message": str(exc)})
     finally:
         # Retain session state for a while so SRT download and chat keep working;
         # the sweeper purges it (vector store included) once the window elapses.

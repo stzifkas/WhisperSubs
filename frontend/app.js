@@ -297,6 +297,14 @@ function connectWS() {
       case 'subtitle_lock':
         handleSubtitleLock(msg.id);
         break;
+      case 'status':
+        if (msg.status === 'reconnecting') {
+          setStatus('Reconnecting…', 'error');
+          showToast('Reconnecting to transcription service…', 'warn');
+        } else if (msg.status === 'connected') {
+          setStatus('Connected', 'connected');
+        }
+        break;
       case 'warning':
         showToast(msg.message, 'warn');
         break;
