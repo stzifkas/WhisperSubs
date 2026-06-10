@@ -309,7 +309,7 @@ async def ws_endpoint(websocket: WebSocket):
         try:
             await websocket.send_json(payload)
             return True
-        except (WebSocketDisconnect, RuntimeError):
+        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed, RuntimeError):
             return False
 
     async def client_receiver():
