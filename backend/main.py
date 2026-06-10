@@ -19,9 +19,7 @@ from . import config
 from .confidence import confidence_level, parse_confidence
 from .context_extractor import maybe_update_context
 from .interpreter_modes import (
-    DEFAULT_MODE,
     InterpreterMode,
-    MODE_PROFILES,
     SessionPolicy,
 )
 from .revision_policy import SubtitleState, log_decision
@@ -377,7 +375,7 @@ async def ws_endpoint(websocket: WebSocket):
                             if delta:
                                 try:
                                     await websocket.send_json({"type": "transcript_delta", "delta": delta})
-                                except Exception:
+                                except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
                                     break
 
                         elif etype == "conversation.item.input_audio_transcription.completed":
@@ -410,7 +408,7 @@ async def ws_endpoint(websocket: WebSocket):
                                                 "type": "subtitle_lock",
                                                 "id": locked_idx,
                                             })
-                                        except Exception:
+                                        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
                                             break
                                     decision = policy.tracker.decide_revision(segment_index)
                                     log_decision(decision, policy.tracker.mode, session_id)
@@ -491,7 +489,7 @@ async def ws_endpoint(websocket: WebSocket):
                                          "confidence": confidence, "state": final_state.value},
                                     ))
 
-                                except Exception:
+                                except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
                                     break
 
                         elif etype == "error":
@@ -499,7 +497,7 @@ async def ws_endpoint(websocket: WebSocket):
                             logger.error("OpenAI Realtime error: %s", event)
                             try:
                                 await websocket.send_json({"type": "error", "message": err})
-                            except Exception:
+                            except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
                                 pass
 
                 except websockets.exceptions.ConnectionClosed:
